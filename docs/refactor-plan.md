@@ -132,6 +132,16 @@
 - `/network.json` 新增 `ap_password` 字段、`main/app_config.h` 的 `APP_BUILD_ID` 单一来源。
 - SNTP 回调钩子用法（配合 `sd_logger_notify_time_synced`）。
 
+### 2.7 配网响应优化：延迟 STA 应用（追加，用户要求）
+
+- **问题**：`wifi_manager_set_credentials` 在事务内同步 `esp_wifi_disconnect()` + `esp_wifi_connect()`，
+  导致 HTTP 配网 POST 的响应在 STA 重连窗口内丢失（客户端 `HTTP_STATUS=000`）。
+- **修复**：`wifi_manager` 新增 `s_apply_timer`（150ms 单次定时器），`apply_sta_config` 改为
+  `esp_wifi_set_config` 后**延迟**执行"断开+重连"。事务照常返回、HTTP 响应先发出，之后 STA 再重连。
+- `wifi_config_store_apply_credentials` 的事务 API 与原子性不变；修复完全落在 wifi_manager 内部。
+- **验证**：POST 返回 `{"ok":true,...,"message":"saved; reconnecting STA"}` HTTP 200；
+  串口显示 `Applying STA config, reconnecting to HUAWEI888` 在 `all tasks started` 之后 ~150ms 触发。
+
 ### 验收与提交
 
 - 每步跑 `tests/test_led_decoupling.py` 全绿；迁移/新增的测试随对应改动提交。
