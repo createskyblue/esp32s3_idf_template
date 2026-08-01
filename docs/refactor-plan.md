@@ -1,6 +1,8 @@
 # 模板解耦重构计划
 
-> 2026-08-02 定稿。范围 = 扫描报告里用户同意的三项优先级改动。
+> 2026-08-02 定稿。
+> - **Phase 1（已完成）**：扫描报告里用户同意的三项优先级改动。
+> - **Phase 2（本次执行）**：用户批准的第二批改动（见文末），仅"安全边界"被用户明确忽略。
 > 原则：**增量重构，保持现有边界与架构测试通过**（`tests/test_led_decoupling.py`）。
 
 ## 目标
@@ -78,11 +80,66 @@
 - 若测试覆盖了被删除的代码（如 sd 演示代码相关断言），同步更新测试；新增针对本次改动的断言。
 - 提交按变更分组，commit message 用现有风格（`refactor:` / `feat:` 前缀）。
 
-## 可选后续（本次不做，记录防遗忘）
+## Phase 2（本次执行，用户已批准）
 
-- `web_platform.c`（524 行）拆分：WiFi 配置事务（`:269-378`）移出平台模块。
-- `ota_manager`（832 行）状态机与 HTTP handler 解耦。
-- SNTP 事件对外通知钩子，供 `sd_logger_notify_time_synced()` 接入。
-- 前端双页面公共 CSS。
-- `ota_manager.c:26`/`:603` 重复宏、`:656` 魔法数字 257、`led_fatal_error()` 死 API 清理。
-- `tests/` 增加真正的行为测试（目前只有文本正则断言）。
+> 用户明确忽略"安全边界"项（设备私人/内部使用，Web 面板无需鉴权）。
+
+### 2.1 拆分 web_platform 的 WiFi 配置事务（业务逻辑移出平台模块）
+
+- `main/web_platform.c` 的 `wifi_config_post_handler`（`:269-378`，约 110 行）含
+  stage→snapshot→apply→commit→rollback 事务。把事务整体移入 `wifi_config_store`，
+  新增复合 API `wifi_config_store_apply_credentials(const wifi_manager_credentials_t *)`：
+  - 内部顺序：校验 → `stage_unlocked` → `wifi_manager_get_credentials`(snapshot) →
+    `wifi_manager_set_credentials`(apply) → `commit_unlocked` → 失败回滚
+    （`wifi_manager_set_credentials(previous)`，再失败则 `enter_provisioning_mode`）。
+  - 失败路径在 store 内用 `ESP_LOGE` 记录细节；`web_platform` 只发统一 500。
+- `web_platform` 的 handler 收敛为：busy 检查 → `try_acquire` → 调 `apply_credentials` → release → 响应。
+- **测试迁移**：`test_web_applies_then_atomically_persists_with_rollback` 断言的是
+  web_platform.c 内的事务调用顺序；改为断言"事务位于 wifi_config_store.c，web_platform 委托
+  `apply_credentials`"。
+
+### 2.2 SNTP 时间同步对外回调钩子
+
+- `wifi_manager` 新增 `wifi_manager_time_synced_cb_t` + `wifi_manager_set_time_synced_callback(cb, ctx)`；
+  `sntp_event_handler` 触发时调用（若已设置）。
+- 目的：`sd_logger_notify_time_synced()` 不必再重复注册 `NETIF_SNTP_EVENT` handler。
+- 默认固件不接线（sd_logger 可选），作为扩展点 + README 文档。测试断言 setter 存在。
+
+### 2.3 前端公共 CSS
+
+- 新建 `data/common.css`，抽取两页面共享的 `:root` tokens、`body`、`h1`、按钮族、`.top`/`.actions`/`.panel`。
+- `index.html` / `files.html` 引入 `<link rel="stylesheet" href="/common.css">`，各自保留页面专属样式
+  （`main` 宽度、卡片/表单/表格、`button.danger` 等）。
+- 静态 fallback 已能按扩展名提供 `text/css`，`/common.css` 直接可用。
+
+### 2.4 清理 json 组件残留 —— **已取消（判定为误判）**
+
+- 原计划删除 `components/json/include/mbedtls/{md5,sha256}.h`，理由是"grep 无人引用"。
+- **实际**：`esp_ota_service`（managed component）的 verifier 源码 include `mbedtls/md5.h` / `mbedtls/sha256.h`，
+  这两个头是 mbedtls v4 把 MD5/SHA256 移入 private 目录后的**兼容 shim**，靠 json 组件的 include 目录提供。
+- 之前 grep 未命中是因为 `managed_components/` 在 `.gitignore` 中，ripgrep 默认跳过。
+- **结论：保留这两个 shim 头，不删。**
+
+### 2.5 卫生清理
+
+- `ota_manager.c` `char fw_url[257]` 魔法数字 → `OTA_URL_MAX_BYTES + 1u`。
+- `led_fatal_error()`（led_task）当前死 API → 接入 `main.c` 的致命错误路径
+  （WiFi 初始化硬失败 `return` 前点亮红灯），使其有真实调用点。
+
+### 2.6 README 补充
+
+- 新增 `sd_card_init_with_config()` / `sd_logger_init_with_config()` 用法。
+- `/network.json` 新增 `ap_password` 字段、`main/app_config.h` 的 `APP_BUILD_ID` 单一来源。
+- SNTP 回调钩子用法（配合 `sd_logger_notify_time_synced`）。
+
+### 验收与提交
+
+- 每步跑 `tests/test_led_decoupling.py` 全绿；迁移/新增的测试随对应改动提交。
+- `idf.py build` + 烧录 COM12 + 串口抓启动日志 + HTTP 实测（POST 相同凭据验证事务不破坏现网连接）。
+- 按 Phase 2 的分项提交（`refactor:` / `docs:` / `test:` 前缀）。
+
+## 仍为可选项（本次不做，记录防遗忘）
+
+- `ota_manager`（832 行）状态机与 HTTP handler 进一步解耦。
+- `tests/` 增加真正的行为级测试（IDF host-test 框架，投入较大）。
+- 时区 `setenv("TZ","CST-8")` 是模板默认值，写死在 `main.c`——如需通用化再议。
