@@ -119,6 +119,9 @@
   这两个头是 mbedtls v4 把 MD5/SHA256 移入 private 目录后的**兼容 shim**，靠 json 组件的 include 目录提供。
 - 之前 grep 未命中是因为 `managed_components/` 在 `.gitignore` 中，ripgrep 默认跳过。
 - **结论：保留这两个 shim 头，不删。**
+- **补充（OTA 去耦合后）**：OTA 已改为原生 `esp_http_client + esp_ota_*` 实现（`ota_manager`），
+  `esp_ota_service`/`esp_service` 等 ADF 组件已从 `idf_component.yml` / `dependencies.lock` 移除，
+  这两个 shim 现无任何构建组件引用。与子项目保持一致暂予保留，后续可单独清理。
 
 ### 2.5 卫生清理
 
