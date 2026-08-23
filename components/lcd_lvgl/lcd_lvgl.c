@@ -12,6 +12,7 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_st7789.h"
+#include "esp_lcd_touch_ft5x06.h"
 #include "esp_log.h"
 #include "esp_private/esp_clk.h"
 #include "esp_timer.h"
@@ -19,6 +20,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lvgl.h"
+#include "demos/lv_demos.h"
 
 /* ═══════════════ 立创实战派 ESP32-S3 引脚定义 ═══════════════ */
 
@@ -66,7 +68,7 @@
 #define LCD_BUFFER_BYTES    (LCD_H_RES * LCD_BUFFER_ROWS * sizeof(uint16_t))
 
 #define DISPLAY_TASK_STACK_BYTES 16384u
-#define DISPLAY_TASK_PRIORITY    10u
+#define DISPLAY_TASK_PRIORITY    7u
 /* How often the display task polls lv_timer_handler. Must be well below the
  * LVGL refresh period (16 ms) so a 60 Hz refresh actually gets serviced. */
 #define DISPLAY_REFRESH_MS       5u
@@ -351,35 +353,64 @@ static void lcd_flush_cb(lv_display_t *disp, const lv_area_t *area,
 #endif
 }
 
-/* Full-screen HSV demo: the whole panel cycles through the hue wheel together
- * (with a gentle brightness breathing). Only the screen background color
- * changes, so LVGL renders it with a fast fill (no per-pixel canvas work) ?
- * that keeps CPU low and lets the real ~60 fps show in LVGL's built-in
- * performance monitor (top-left "FPS/CPU" window). */
-static lv_obj_t *s_demo_screen = NULL;
+/* ═══════════════ FT5x06 电容触摸（立创实战派触摸屏，与 LCD 同 I2C 总线）═══════════ */
 
-static void demo_hsv_timer_cb(lv_timer_t *timer)
+static esp_lcd_touch_handle_t s_touch = NULL;
+
+/* LVGL 轮询读取触摸点（LV_OS_NONE：read_cb 运行在 display 任务上下文，天然线程安全） */
+static void touch_read_cb(lv_indev_t *drv, lv_indev_data_t *data)
 {
-    static uint32_t tick = 0;
-
-    /* Whole panel shares one hue; full 360deg cycle every ~12 s at 60 fps. */
-    const uint16_t hue = (uint16_t)((tick / 2u) % 360u);
-    /* Brightness breathes ~199..255 so colors stay vivid, never grey. */
-    const uint8_t value = (uint8_t)(227 + (28 * lv_trigo_sin((int16_t)((tick * 3) % 3600)) / 1000));
-
-    lv_obj_set_style_bg_color(s_demo_screen, lv_color_hsv_to_rgb(hue, 255, value), 0);
-    lv_obj_invalidate(s_demo_screen);
-
-    tick++;
-    (void)timer;
+    (void)drv;
+    if (s_touch == NULL) {
+        data->state = LV_INDEV_STATE_REL;
+        return;
+    }
+    esp_lcd_touch_read_data(s_touch);
+    esp_lcd_touch_point_data_t pts[1];
+    uint8_t n = 0;
+    if (esp_lcd_touch_get_data(s_touch, pts, &n, 1) == ESP_OK && n > 0) {
+        data->point.x = pts[0].x;
+        data->point.y = pts[0].y;
+        data->state = LV_INDEV_STATE_PRESSED;
+    } else {
+        data->state = LV_INDEV_STATE_REL;
+    }
 }
 
-static void demo_screen_create(void)
+/* 初始化触摸屏并注册 LVGL 指针输入设备；坐标映射与屏幕旋转（swap_xy + mirror_x）一致 */
+static void bsp_touch_init(void)
 {
-    s_demo_screen = lv_scr_act();
-    lv_obj_set_style_bg_color(s_demo_screen, lv_color_hex(0x000000), 0);
-    lv_timer_t *t = lv_timer_create(demo_hsv_timer_cb, 16, NULL);
-    lv_timer_ready(t);   /* paint the first frame immediately */
+    esp_lcd_touch_config_t tp_cfg = {
+        .x_max = LCD_V_RES,      /* 触控 IC 原生 240x320，经 swap+mirror 映射到 320x240 */
+        .y_max = LCD_H_RES,
+        .rst_gpio_num = GPIO_NUM_NC,  /* 与 LCD 共用复位 */
+        .int_gpio_num = GPIO_NUM_NC,  /* 轮询模式，不用中断脚 */
+        .levels = {
+            .reset = 0,
+            .interrupt = 0,
+        },
+        .flags = {
+            .swap_xy = 1,
+            .mirror_x = 1,
+            .mirror_y = 0,
+        },
+    };
+
+    esp_lcd_panel_io_handle_t tp_io = NULL;
+    const esp_lcd_panel_io_i2c_config_t tp_io_cfg = ESP_LCD_TOUCH_IO_I2C_FT5x06_CONFIG();
+    if (esp_lcd_new_panel_io_i2c(s_i2c_bus, &tp_io_cfg, &tp_io) != ESP_OK) {
+        ESP_LOGE(TAG, "touch panel IO init failed");
+        return;
+    }
+    if (esp_lcd_touch_new_i2c_ft5x06(tp_io, &tp_cfg, &s_touch) != ESP_OK) {
+        ESP_LOGE(TAG, "FT5x06 touch init failed");
+        return;
+    }
+
+    lv_indev_t *indev = lv_indev_create();
+    lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_read_cb(indev, touch_read_cb);
+    ESP_LOGI(TAG, "FT5x06 touch ready, LVGL pointer indev registered");
 }
 
 #if CONFIG_LCD_LVGL_BENCHMARK
@@ -494,7 +525,10 @@ static void display_task(void *arg)
     lv_display_set_buffers(disp, buf1, buf2, LCD_BUFFER_BYTES,
                            LV_DISPLAY_RENDER_MODE_PARTIAL);
 
-    demo_screen_create();
+    bsp_touch_init();
+    /* LVGL 官方 widget 示例（menuconfig 开启 LV_USE_DEMO_WIDGETS）
+     * 替换原 HSV 彩色刷屏，带可交互控件，配合触摸演示。 */
+    lv_demo_widgets();
 
     ESP_LOGI(TAG, "display task started");
 #if CONFIG_LCD_LVGL_BENCHMARK
