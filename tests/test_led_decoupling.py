@@ -389,6 +389,39 @@ class ComponentBoundaryTests(unittest.TestCase):
         self.assertNotIn("blufi_provisioning", cmake)
         self.assertIn("心率", header)
 
+    def test_blufi_scan_yields_sta_to_wifi_scan(self):
+        blufi_source = (
+            PROJECT_ROOT / "components" / "blufi_provisioning" / "blufi_provisioning.c"
+        ).read_text(encoding="utf-8")
+        wm_header = (
+            PROJECT_ROOT / "components" / "wifi_manager" / "wifi_manager.h"
+        ).read_text(encoding="utf-8")
+        wm_source = (
+            PROJECT_ROOT / "components" / "wifi_manager" / "wifi_manager.c"
+        ).read_text(encoding="utf-8")
+
+        # 手机请求扫描列表时才临时挂起 STA（connecting 会阻塞 esp_wifi_scan_start），
+        # 扫描结束（SCAN_DONE）后立即恢复；普通退避重连不受影响。
+        self.assertIn("wifi_manager_suspend_sta()", blufi_source)
+        self.assertIn("wifi_manager_resume_sta()", blufi_source)
+        self.assertLess(
+            blufi_source.index("wifi_manager_suspend_sta()"),
+            blufi_source.index("esp_wifi_scan_start"),
+        )
+        self.assertLess(
+            blufi_source.index("send_wifi_list()"),
+            blufi_source.index("wifi_manager_resume_sta()"),
+        )
+        self.assertIn("wifi_manager_suspend_sta", wm_header)
+        self.assertIn("wifi_manager_resume_sta", wm_header)
+        self.assertIn("s_sta_suspended", wm_source)
+        self.assertIn("wifi_manager_suspend_sta", wm_source)
+        self.assertIn("wifi_manager_resume_sta", wm_source)
+        # 已移除"连续 NO_AP_FOUND 后永久暂停重连"的旧逻辑（路由器临时关机的
+        # 场景应保持自动重连）。
+        self.assertNotIn("s_no_ap_failures", wm_source)
+        self.assertNotIn("STA_QUIET", wm_source)
+
     def test_defaults_do_not_enable_unused_runtime_features(self):
         defaults = (PROJECT_ROOT / "sdkconfig.defaults").read_text(
             encoding="utf-8"

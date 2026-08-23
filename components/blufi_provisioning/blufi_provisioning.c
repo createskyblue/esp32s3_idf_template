@@ -1,6 +1,7 @@
 #include "blufi_provisioning.h"
 #include "blufi_security.h"
 #include "ble_host.h"
+#include "wifi_manager.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -82,12 +83,11 @@ static void send_wifi_conn_report(void)
 
 static void send_wifi_list(void)
 {
-    if (!s_ble_connected) {
-        esp_wifi_scan_stop();
-        return;
-    }
     uint16_t ap_count = 0;
-    if (esp_wifi_scan_get_ap_num(&ap_count) != ESP_OK || ap_count == 0) {
+    const esp_err_t get_num_err = esp_wifi_scan_get_ap_num(&ap_count);
+    if (get_num_err != ESP_OK || ap_count == 0) {
+        ESP_LOGW(TAG, "wifi list: scan_get_ap_num=%s count=%u",
+                 esp_err_to_name(get_num_err), (unsigned)ap_count);
         esp_wifi_scan_stop();
         esp_blufi_send_error_info(ESP_BLUFI_WIFI_SCAN_FAIL);
         return;
@@ -106,7 +106,10 @@ static void send_wifi_list(void)
         blufi_list[i].rssi = ap_list[i].rssi;
         memcpy(blufi_list[i].ssid, ap_list[i].ssid, sizeof(ap_list[i].ssid));
     }
-    esp_blufi_send_wifi_list(ap_count, blufi_list);
+    /* 发送由 esp_blufi 自行校验 notify 订阅状态，不在这里提前丢弃 */
+    const esp_err_t send_err = esp_blufi_send_wifi_list(ap_count, blufi_list);
+    ESP_LOGI(TAG, "wifi list: %u APs, send=%s", (unsigned)ap_count,
+             esp_err_to_name(send_err));
     esp_wifi_scan_stop();
     free(ap_list);
     free(blufi_list);
@@ -141,6 +144,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         break;
     case WIFI_EVENT_SCAN_DONE:
         send_wifi_list();
+        wifi_manager_resume_sta();   /* 扫描完成，恢复 STA 自动重连 */
         break;
     default:
         break;
@@ -162,6 +166,16 @@ static void ip_event_handler(void *arg, esp_event_base_t event_base,
 /* ── BluFi 事件 ────────────────────────────────────────────────────────── */
 static void blufi_event_cb(esp_blufi_cb_event_t event, esp_blufi_cb_param_t *param)
 {
+    /* 诊断：打印收到的每个 BluFi 事件，确认手机请求是否到达 */
+    ESP_LOGI(TAG, "blufi event=%d", (int)event);
+    /* 除连接生命周期/初始化事件外，任何事件都只能在一条活跃的 BLE 连接上
+     * 到达——用它来维护会话标志，避免依赖可能缺失的 BLE_CONNECT 事件
+     * （蓝牙栈在多连接场景下可能把连接建立事件报为失败）。 */
+    if (event != ESP_BLUFI_EVENT_INIT_FINISH &&
+        event != ESP_BLUFI_EVENT_DEINIT_FINISH &&
+        event != ESP_BLUFI_EVENT_BLE_DISCONNECT) {
+        s_ble_connected = true;
+    }
     switch (event) {
     case ESP_BLUFI_EVENT_INIT_FINISH:
         ESP_LOGI(TAG, "BluFi init finished, advertising");
@@ -176,6 +190,9 @@ static void blufi_event_cb(esp_blufi_cb_event_t event, esp_blufi_cb_param_t *par
         esp_blufi_adv_stop();
         blufi_security_init();
         memset(&s_pending_creds, 0, sizeof(s_pending_creds));
+        /* 挂起 STA 的时机在 GET_WIFI_LIST（手机明确请求扫描）时，
+         * 由 wifi_manager_suspend_sta()/resume_sta() 按扫描生命周期管理；
+         * 普通自动重连保持不受影响。 */
         break;
     case ESP_BLUFI_EVENT_BLE_DISCONNECT:
         ESP_LOGI(TAG, "BLE disconnected");
@@ -278,6 +295,9 @@ static void blufi_event_cb(esp_blufi_cb_event_t event, esp_blufi_cb_param_t *par
     }
     case ESP_BLUFI_EVENT_GET_WIFI_LIST: {
         ESP_LOGI(TAG, "phone requests WiFi list; starting scan");
+        /* 手机明确请求扫描：临时挂起 STA（connecting 状态会阻塞
+         * esp_wifi_scan_start），扫描结束（SCAN_DONE）后立即恢复。 */
+        wifi_manager_suspend_sta();
         wifi_scan_config_t scan_cfg = {
             .ssid = NULL,
             .bssid = NULL,
@@ -286,6 +306,7 @@ static void blufi_event_cb(esp_blufi_cb_event_t event, esp_blufi_cb_param_t *par
             .scan_type = WIFI_SCAN_TYPE_ACTIVE,
         };
         if (esp_wifi_scan_start(&scan_cfg, false) != ESP_OK) {
+            wifi_manager_resume_sta();   /* 启动失败立即恢复 */
             esp_blufi_send_error_info(ESP_BLUFI_WIFI_SCAN_FAIL);
         }
         break;

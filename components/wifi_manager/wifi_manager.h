@@ -73,6 +73,18 @@ esp_err_t wifi_manager_set_credentials(
 /** Disable STA reconnects and leave the provisioning SoftAP active. */
 esp_err_t wifi_manager_enter_provisioning_mode(void);
 
+/**
+ * 暂时挂起 STA 自动重连：停止退避定时器并中止正在进行的连接尝试，让出
+ * 无线信道给外部 WiFi 扫描（如 BluFi 配网请求 WiFi 列表）。WiFi 驱动在
+ * STA 处于 connecting 状态时拒绝并发扫描（"STA is connecting, scan are
+ * not allowed"）。已连接时仅置挂起标志，不断开已建立的连接。
+ * 扫描完成后必须调用 wifi_manager_resume_sta() 恢复。
+ */
+esp_err_t wifi_manager_suspend_sta(void);
+
+/** 恢复 STA 自动重连：清挂起标志并立即发起一次连接尝试（失败走既有退避）。 */
+esp_err_t wifi_manager_resume_sta(void);
+
 /** SoftAP SSID exposed for status responses. */
 const char *wifi_manager_get_ap_ssid(void);
 

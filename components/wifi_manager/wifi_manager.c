@@ -19,7 +19,9 @@
 #include "nvs_flash.h"
 
 #define WIFI_STA_RECONNECT_INITIAL_DELAY_MS 5000u
-#define WIFI_STA_RECONNECT_MAX_DELAY_MS     60000u
+/* 最大退避 5 分钟：AP 不可达时停止高频重连，避免 Wi-Fi/BT 共存策略
+ * 持续压制 BLE 无线（配网页/BluFi 需要稳定的蓝牙链路）。 */
+#define WIFI_STA_RECONNECT_MAX_DELAY_MS     300000u
 #define WIFI_STA_APPLY_DELAY_MS             3000u
 #define DNS_PORT                            53
 #define DNS_MAX_QUERY_LEN                   512
@@ -44,6 +46,7 @@ static esp_timer_handle_t s_apply_timer;
 static bool                s_sta_apply_pending;
 static SemaphoreHandle_t   s_credentials_mutex;
 static bool                s_started;
+static bool                s_sta_suspended;   /* 配网扫描期间挂起 STA 重连 */
 static wifi_manager_time_synced_cb_t s_time_synced_cb;
 static void               *s_time_synced_ctx;
 static esp_timer_handle_t  s_ap_apply_timer;
@@ -242,6 +245,8 @@ static void schedule_reconnect(void)
         s_reconnect_timer == NULL) return;
     if (esp_timer_is_active(s_reconnect_timer)) return;
 
+    /* 普通退避重连：AP 不可达时按 5s→10s→20s→… 退避，不打断自动重连。
+     * 配网扫描期间由调用方（blufi）通过 suspend_sta/resume_sta 临时让出无线。 */
     uint32_t delay_ms = s_reconnect_delay_ms;
     esp_err_t err = esp_timer_start_once(s_reconnect_timer, (uint64_t)delay_ms * 1000ULL);
     if (err == ESP_OK) {
@@ -451,9 +456,15 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
         s_sta_connected = false;
         s_sta_ip.addr = 0u;
-        ESP_LOGI(TAG, "WiFi disconnected, reason=%u; backoff reconnect",
-                 event != NULL ? (unsigned)event->reason : 0u);
-        schedule_reconnect();
+        if (s_sta_suspended) {
+            /* 挂起期间（配网扫描）不安排重连，避免连接尝试再次阻塞扫描 */
+            ESP_LOGI(TAG, "WiFi disconnected, reason=%u; STA suspended (scan in progress)",
+                     event != NULL ? (unsigned)event->reason : 0u);
+        } else {
+            ESP_LOGI(TAG, "WiFi disconnected, reason=%u; backoff reconnect",
+                     event != NULL ? (unsigned)event->reason : 0u);
+            schedule_reconnect();
+        }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         s_sta_connected = true;
@@ -741,6 +752,30 @@ esp_err_t wifi_manager_enter_provisioning_mode(void)
     const esp_err_t err = enter_provisioning_mode_locked();
     credentials_unlock();
     return err;
+}
+
+/* 挂起 STA：配网扫描前调用，避免 STA 的 connecting 状态阻塞 esp_wifi_scan_start */
+esp_err_t wifi_manager_suspend_sta(void)
+{
+    if (!s_started) return ESP_ERR_INVALID_STATE;
+    s_sta_suspended = true;
+    stop_reconnect_timer();
+    s_reconnect_delay_ms = WIFI_STA_RECONNECT_INITIAL_DELAY_MS;
+    if (!s_sta_connected) {
+        /* 中止正在进行的连接尝试，让无线进入空闲；已连接则不断开 */
+        (void)esp_wifi_disconnect();
+    }
+    return ESP_OK;
+}
+
+/* 恢复 STA：扫描完成后调用，立即重连（失败走既有退避） */
+esp_err_t wifi_manager_resume_sta(void)
+{
+    if (!s_started) return ESP_ERR_INVALID_STATE;
+    s_sta_suspended = false;
+    if (s_sta_connected) return ESP_OK;
+    stop_reconnect_timer();
+    return connect_current_sta_now();
 }
 
 /* ── public: constants ─────────────────────────────────────────────────── */

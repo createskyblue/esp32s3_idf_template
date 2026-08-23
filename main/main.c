@@ -208,7 +208,7 @@ void app_main(void)
     if (ble_echo_init() != ESP_OK) {
         ESP_LOGW(TAG, "BLE echo init failed");
     }
-    /* BLE 主机测试：扫描睡眠垫(NUS) → 连接 → 订阅 → 打印数据 */
+    /* BLE 主机测试：心率广播演示（连华为手环收心率） */
     if (ble_host_test_init() != ESP_OK) {
         ESP_LOGW(TAG, "BLE host test init failed");
     }
