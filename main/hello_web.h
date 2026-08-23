@@ -12,5 +12,8 @@
  *   web_platform_init();
  *   hello_web_register(web_platform_get_server());          // ← 你的业务
  *   web_platform_register_static_fallback();                // 必须最后
+ *
+ * 注意：若已移除 wifi_config_http（应用无私有文件），须先调用
+ * web_platform_set_private_path_cb(NULL) 显式声明，否则静态回退拒绝注册。
  */
 esp_err_t hello_web_register(httpd_handle_t server);

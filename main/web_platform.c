@@ -2,9 +2,6 @@
 #include "file_manager.h"
 #include "ota_manager.h"
 #include "app_storage.h"
-#include "app_config.h"
-#include "wifi_config_store.h"
-#include "wifi_manager.h"
 #include "sd_card.h"
 
 #include "json_http.h"
@@ -15,7 +12,6 @@
 #include <string.h>
 
 #include "cJSON.h"
-#include "esp_app_desc.h"
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -27,7 +23,6 @@
 /* ── constants ─────────────────────────────────────────────────────────── */
 #define LITTLEFS_INDEX_PATH          APP_LITTLEFS_BASE_PATH "/index.html"
 #define HTTP_FILE_BUFFER_BYTES       1024u
-#define HTTP_JSON_BUFFER_BYTES       512u
 
 static const char *TAG = "WEB_PLATFORM";
 static const char FILESYSTEM_RECOVERY_HTML[] =
@@ -45,14 +40,13 @@ static const char FILESYSTEM_RECOVERY_HTML[] =
 /* ── HTTP server handle ────────────────────────────────────────────────── */
 static httpd_handle_t s_http_server;
 static esp_timer_handle_t s_reboot_timer;
+static web_platform_private_path_cb_t s_private_path_cb;
+static bool s_private_path_cb_installed;
 
-static const char *protect_wifi_config(const char *fs_type, const char *path)
+void web_platform_set_private_path_cb(web_platform_private_path_cb_t cb)
 {
-    if (fs_type != NULL && strcmp(fs_type, "internal") == 0 &&
-        wifi_config_store_is_path(path)) {
-        return "WiFi configuration is application-private";
-    }
-    return NULL;
+    s_private_path_cb = cb;
+    s_private_path_cb_installed = true;
 }
 
 static bool resolve_static_path(const char *uri, char *path, size_t path_size)
@@ -149,7 +143,7 @@ static esp_err_t littlefs_static_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid static path");
         return ESP_FAIL;
     }
-    if (wifi_config_store_is_path(path)) {
+    if (s_private_path_cb != NULL && s_private_path_cb(path)) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "file not found");
         return ESP_FAIL;
     }
@@ -194,246 +188,6 @@ static esp_err_t littlefs_static_handler(httpd_req_t *req)
     app_storage_release();
     if (err == ESP_OK) err = httpd_resp_send_chunk(req, NULL, 0);
     return err;
-}
-
-/* ── GET /network.json ─────────────────────────────────────────────────── */
-static esp_err_t network_json_handler(httpd_req_t *req)
-{
-    wifi_snapshot_t snap;
-    wifi_manager_get_snapshot(&snap);
-
-    cJSON *root = cJSON_CreateObject();
-    if (root == NULL) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json allocation failed");
-        return ESP_FAIL;
-    }
-    cJSON_AddBoolToObject(root, "sta_connected", snap.sta_connected);
-    cJSON_AddStringToObject(root, "sta_ssid", snap.sta_ssid);
-    cJSON_AddStringToObject(root, "sta_ip", snap.sta_connected ? snap.sta_ip : "0.0.0.0");
-    cJSON_AddStringToObject(root, "ap_ssid", wifi_manager_get_ap_ssid());
-    cJSON_AddStringToObject(root, "ap_password", wifi_manager_get_ap_password());
-    cJSON_AddStringToObject(root, "ap_ip", snap.ap_ip);
-    cJSON_AddStringToObject(root, "config_path", wifi_config_store_get_path());
-    cJSON_AddBoolToObject(root, "config_exists", wifi_config_store_exists());
-
-    const esp_app_desc_t *app_desc = esp_app_get_description();
-    char build_ts[32];
-    snprintf(build_ts, sizeof(build_ts), "%s %s", app_desc->date, app_desc->time);
-    cJSON_AddStringToObject(root, "app_build_id", APP_BUILD_ID);
-    cJSON_AddStringToObject(root, "firmware_sha256", esp_app_get_elf_sha256_str());
-    cJSON_AddStringToObject(root, "build_timestamp", build_ts);
-    cJSON_AddStringToObject(root, "idf_version", app_desc->idf_ver);
-    return send_json_object(req, root);
-}
-
-/* ── GET /wifi_config.json ─────────────────────────────────────────────── */
-static esp_err_t wifi_config_get_handler(httpd_req_t *req)
-{
-    wifi_snapshot_t snap;
-    wifi_manager_get_snapshot(&snap);
-
-    /* Load the persisted config so the page can prefill the settings;
-     * fall back to the runtime snapshot (empty fields) when the filesystem
-     * is busy or the file is missing/corrupt. */
-    wifi_persisted_config_t saved = {0};
-    bool have_saved = false;
-    if (app_storage_try_acquire() == ESP_OK) {
-        have_saved = wifi_config_store_load_full(&saved) == ESP_OK;
-        app_storage_release();
-    }
-
-    cJSON *root = cJSON_CreateObject();
-    if (root == NULL) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json allocation failed");
-        return ESP_FAIL;
-    }
-    cJSON_AddStringToObject(root, "ssid", have_saved ? saved.sta.sta_ssid : snap.sta_ssid);
-    cJSON_AddBoolToObject(root, "has_password", snap.has_password);
-    cJSON_AddStringToObject(root, "ip_mode",
-                            have_saved && saved.sta.ip_static ? "static" : "dhcp");
-    cJSON_AddStringToObject(root, "static_ip", have_saved ? saved.sta.ip_addr : "");
-    cJSON_AddStringToObject(root, "netmask", have_saved ? saved.sta.ip_netmask : "");
-    cJSON_AddStringToObject(root, "gateway", have_saved ? saved.sta.ip_gateway : "");
-    cJSON_AddStringToObject(root, "dns", have_saved ? saved.sta.ip_dns : "");
-    cJSON_AddStringToObject(root, "ap_ssid",
-                            have_saved && saved.ap_ssid[0] != '\0'
-                                ? saved.ap_ssid : wifi_manager_get_ap_ssid());
-    cJSON_AddStringToObject(root, "ap_password",
-                            have_saved && saved.ap_ssid[0] != '\0'
-                                ? saved.ap_password : wifi_manager_get_ap_password());
-    cJSON_AddStringToObject(root, "path", wifi_config_store_get_path());
-    cJSON_AddBoolToObject(root, "config_exists", wifi_config_store_exists());
-    return send_json_object(req, root);
-}
-
-/* ── POST /wifi_config.json ────────────────────────────────────────────── */
-static esp_err_t wifi_config_post_handler(httpd_req_t *req)
-{
-    if (ota_manager_is_busy()) {
-        httpd_resp_set_status(req, "409 Conflict");
-        return httpd_resp_sendstr(req,
-                                  "cannot update WiFi configuration during OTA");
-    }
-
-    char body[HTTP_JSON_BUFFER_BYTES];
-    if (receive_json_body(req, body, sizeof(body)) != ESP_OK) return ESP_FAIL;
-
-    cJSON *root = cJSON_Parse(body);
-    if (root == NULL) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON");
-        return ESP_FAIL;
-    }
-
-    /* Partial update: load the persisted config as the base so a request can
-     * change only the WiFi credentials, IP policy, or AP identity without
-     * touching the others, and without wiping a previously saved password. */
-    wifi_persisted_config_t config = {0};
-    if (app_storage_try_acquire() == ESP_OK) {
-        (void)wifi_config_store_load_full(&config);
-        app_storage_release();
-    }
-
-    cJSON *ssid_item = cJSON_GetObjectItemCaseSensitive(root, "ssid");
-    cJSON *pass_item = cJSON_GetObjectItemCaseSensitive(root, "password");
-    cJSON *ip_mode_item = cJSON_GetObjectItemCaseSensitive(root, "ip_mode");
-    cJSON *ap_ssid_item = cJSON_GetObjectItemCaseSensitive(root, "ap_ssid");
-    cJSON *ap_pass_item = cJSON_GetObjectItemCaseSensitive(root, "ap_password");
-    const bool have_ssid = cJSON_IsString(ssid_item) &&
-                           ssid_item->valuestring != NULL &&
-                           ssid_item->valuestring[0] != '\0';
-    const bool have_ip_mode = cJSON_IsString(ip_mode_item);
-    const bool have_ap_ssid = cJSON_IsString(ap_ssid_item) &&
-                              ap_ssid_item->valuestring != NULL &&
-                              ap_ssid_item->valuestring[0] != '\0';
-    const bool updated_wifi = have_ssid;
-    const bool updated_ap = have_ap_ssid;
-    if (!have_ssid && !have_ip_mode && !have_ap_ssid) {
-        cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                            "provide ssid/password, ip_mode, and/or ap_ssid");
-        return ESP_FAIL;
-    }
-
-    bool valid = true;
-    if (have_ssid) {
-        const size_t ssid_len = strlen(ssid_item->valuestring);
-        if (ssid_len > WIFI_MANAGER_SSID_MAX_BYTES) {
-            valid = false;
-        } else {
-            memcpy(config.sta.sta_ssid, ssid_item->valuestring, ssid_len + 1u);
-            if (pass_item != NULL && cJSON_IsString(pass_item) &&
-                pass_item->valuestring != NULL && pass_item->valuestring[0] != '\0') {
-                const size_t pass_len = strlen(pass_item->valuestring);
-                if (pass_len > WIFI_MANAGER_PASSWORD_MAX_BYTES) {
-                    valid = false;
-                } else {
-                    memcpy(config.sta.sta_password, pass_item->valuestring,
-                           pass_len + 1u);
-                }
-            }
-            /* empty password keeps any previously saved one */
-        }
-    }
-
-    if (have_ip_mode) {
-        if (strcmp(ip_mode_item->valuestring, "static") == 0) {
-            config.sta.ip_static = true;
-            const char *const keys[4] = { "static_ip", "netmask", "gateway", "dns" };
-            char *const fields[4] = { config.sta.ip_addr,
-                                      config.sta.ip_netmask,
-                                      config.sta.ip_gateway,
-                                      config.sta.ip_dns };
-            for (int i = 0; i < 4; ++i) {
-                cJSON *item = cJSON_GetObjectItemCaseSensitive(root, keys[i]);
-                if (!cJSON_IsString(item) || item->valuestring == NULL ||
-                    item->valuestring[0] == '\0' ||
-                    strlen(item->valuestring) > WIFI_MANAGER_IP_MAX_BYTES ||
-                    !wifi_manager_ipv4_is_valid(item->valuestring)) {
-                    valid = false;
-                    break;
-                }
-                memcpy(fields[i], item->valuestring, strlen(item->valuestring) + 1u);
-            }
-        } else if (strcmp(ip_mode_item->valuestring, "dhcp") == 0) {
-            /* Keep the previous static values so switching back to static
-             * restores them; they are ignored while ip_static is false. */
-            config.sta.ip_static = false;
-        } else {
-            valid = false;
-        }
-    }
-
-    if (have_ap_ssid) {
-        const size_t ap_ssid_len = strlen(ap_ssid_item->valuestring);
-        if (ap_ssid_len > WIFI_MANAGER_SSID_MAX_BYTES) {
-            valid = false;
-        } else {
-            memcpy(config.ap_ssid, ap_ssid_item->valuestring, ap_ssid_len + 1u);
-            if (ap_pass_item != NULL && cJSON_IsString(ap_pass_item) &&
-                ap_pass_item->valuestring != NULL &&
-                ap_pass_item->valuestring[0] != '\0') {
-                const size_t ap_pass_len = strlen(ap_pass_item->valuestring);
-                if (ap_pass_len > WIFI_MANAGER_PASSWORD_MAX_BYTES ||
-                    ap_pass_len < 8u) {
-                    valid = false;
-                } else {
-                    memcpy(config.ap_password, ap_pass_item->valuestring,
-                           ap_pass_len + 1u);
-                }
-            }
-            /* empty AP password keeps any previously saved one */
-        }
-    }
-
-    cJSON_Delete(root);
-
-    if (!valid || config.sta.sta_ssid[0] == '\0') {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                            config.sta.sta_ssid[0] == '\0'
-                                ? "no saved WiFi config; provide ssid first"
-                                : "invalid settings");
-        return ESP_FAIL;
-    }
-
-    if (app_storage_try_acquire() != ESP_OK) {
-        httpd_resp_set_status(req, "409 Conflict");
-        return httpd_resp_sendstr(req,
-                                  "filesystem update is already in progress");
-    }
-    if (ota_manager_is_busy()) {
-        app_storage_release();
-        httpd_resp_set_status(req, "409 Conflict");
-        return httpd_resp_sendstr(req,
-                                  "cannot update WiFi configuration during OTA");
-    }
-
-    /* The transactional stage → apply → commit → rollback lives in the store. */
-    esp_err_t err = wifi_config_store_apply_full(&config);
-    app_storage_release();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "apply WiFi config failed: %s", esp_err_to_name(err));
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                            "failed to save wifi config");
-        return ESP_FAIL;
-    }
-
-    cJSON *resp = cJSON_CreateObject();
-    if (resp == NULL) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json allocation failed");
-        return ESP_FAIL;
-    }
-    cJSON_AddBoolToObject(resp, "ok", true);
-    cJSON_AddStringToObject(resp, "ssid", config.sta.sta_ssid);
-    cJSON_AddStringToObject(resp, "path", wifi_config_store_get_path());
-    cJSON_AddStringToObject(resp, "message",
-                            updated_wifi ? "saved; reconnecting STA"
-                            : (updated_ap ? "AP identity saved"
-                                          : "IP settings saved; reconnecting STA"));
-    /* The address the STA will move to after the deferred apply, so the page
-     * can redirect there; empty for DHCP (address unknown until renewal). */
-    cJSON_AddStringToObject(resp, "new_ip",
-                            config.sta.ip_static ? config.sta.ip_addr : "");
-    return send_json_object(req, resp);
 }
 
 /* ── GET /debug.json ───────────────────────────────────────────────────── */
@@ -548,39 +302,43 @@ static esp_err_t start_webserver(void)
     config.stack_size = 16384;
 
     httpd_handle_t server = NULL;
-    if (httpd_start(&server, &config) == ESP_OK) {
-        /* clang-format off */
-        httpd_uri_t root_uri  = { .uri = "/",              .method = HTTP_GET,  .handler = root_handler };
-        httpd_uri_t net_uri   = { .uri = "/network.json",  .method = HTTP_GET,  .handler = network_json_handler };
-        httpd_uri_t wcfg_g_uri= { .uri = "/wifi_config.json", .method = HTTP_GET, .handler = wifi_config_get_handler };
-        httpd_uri_t wcfg_p_uri= { .uri = "/wifi_config.json", .method = HTTP_POST,.handler = wifi_config_post_handler };
-        httpd_uri_t debug_uri = { .uri = "/debug.json",    .method = HTTP_GET,  .handler = debug_json_handler };
-        httpd_uri_t reboot_uri= { .uri = "/reboot",        .method = HTTP_POST, .handler = reboot_handler };
-        /* clang-format on */
-
-        esp_err_t reg_err;
-        if ((reg_err = httpd_register_uri_handler(server, &root_uri))   != ESP_OK ||
-            (reg_err = httpd_register_uri_handler(server, &net_uri))    != ESP_OK ||
-            (reg_err = httpd_register_uri_handler(server, &wcfg_g_uri)) != ESP_OK ||
-            (reg_err = httpd_register_uri_handler(server, &wcfg_p_uri)) != ESP_OK ||
-            (reg_err = httpd_register_uri_handler(server, &debug_uri))  != ESP_OK ||
-            (reg_err = httpd_register_uri_handler(server, &reboot_uri)) != ESP_OK) {
-            ESP_LOGE(TAG, "URI handler registration failed: %s", esp_err_to_name(reg_err));
-        }
-        if (file_manager_register(server) != ESP_OK) {
-            ESP_LOGE(TAG, "file manager registration failed");
-        }
-        if (ota_manager_register(server) != ESP_OK) {
-            ESP_LOGE(TAG, "OTA handler registration failed");
-        }
-
-        /* Static file fallback (catch-all) is NOT registered here — callers must
-         * invoke web_platform_register_static_fallback() LAST so exact URIs
-         * match before the wildcard. */
-        s_http_server = server;
-        ESP_LOGI(TAG, "HTTP server started on port 80");
+    const esp_err_t httpd_err = httpd_start(&server, &config);
+    if (httpd_err != ESP_OK) {
+        ESP_LOGE(TAG, "httpd_start failed: %s", esp_err_to_name(httpd_err));
+        return httpd_err;
     }
-    return server == NULL ? ESP_FAIL : ESP_OK;
+
+    /* clang-format off */
+    httpd_uri_t root_uri  = { .uri = "/",              .method = HTTP_GET,  .handler = root_handler };
+    httpd_uri_t debug_uri = { .uri = "/debug.json",    .method = HTTP_GET,  .handler = debug_json_handler };
+    httpd_uri_t reboot_uri= { .uri = "/reboot",        .method = HTTP_POST, .handler = reboot_handler };
+    /* clang-format on */
+
+    esp_err_t reg_err;
+    if ((reg_err = httpd_register_uri_handler(server, &root_uri))   != ESP_OK ||
+        (reg_err = httpd_register_uri_handler(server, &debug_uri))  != ESP_OK ||
+        (reg_err = httpd_register_uri_handler(server, &reboot_uri)) != ESP_OK) {
+        ESP_LOGE(TAG, "URI handler registration failed: %s", esp_err_to_name(reg_err));
+        httpd_stop(server);
+        return reg_err;
+    }
+    if ((reg_err = file_manager_register(server)) != ESP_OK) {
+        ESP_LOGE(TAG, "file manager registration failed: %s", esp_err_to_name(reg_err));
+        httpd_stop(server);
+        return reg_err;
+    }
+    if ((reg_err = ota_manager_register(server)) != ESP_OK) {
+        ESP_LOGE(TAG, "OTA handler registration failed: %s", esp_err_to_name(reg_err));
+        httpd_stop(server);
+        return reg_err;
+    }
+
+    /* Static file fallback (catch-all) is NOT registered here — callers must
+     * invoke web_platform_register_static_fallback() LAST so exact URIs
+     * match before the wildcard. */
+    s_http_server = server;
+    ESP_LOGI(TAG, "HTTP server started on port 80");
+    return ESP_OK;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -595,6 +353,15 @@ httpd_handle_t web_platform_get_server(void)
 esp_err_t web_platform_register_static_fallback(void)
 {
     if (s_http_server == NULL) return ESP_ERR_INVALID_STATE;
+    /* fail-fast：未安装私有路径策略时拒绝注册回退。否则静态回退会把应用
+     * 私有文件（如 WiFi 凭据）一并对外提供，而模板复制场景容易静默丢失
+     * 该保护——没有私有文件的应用显式调用 web_platform_set_private_path_cb(NULL)。 */
+    if (!s_private_path_cb_installed) {
+        ESP_LOGE(TAG, "no private-path policy installed; refusing to register the "
+                      "static fallback (it would serve application-private files). "
+                      "Call web_platform_set_private_path_cb() first.");
+        return ESP_ERR_INVALID_STATE;
+    }
     static const httpd_uri_t static_uri = {
         .uri = "/*",
         .method = HTTP_GET,
@@ -622,7 +389,6 @@ esp_err_t web_platform_init(void)
     ESP_ERROR_CHECK(ota_manager_init_with_config(&ota_config));
     file_manager_set_access_callbacks(app_storage_try_acquire,
                                       app_storage_release);
-    file_manager_set_read_guard(protect_wifi_config);
-    file_manager_set_mutation_guard(protect_wifi_config);
+    /* 私有文件保护策略由应用层在平台 init 之前安装（见 wifi_config_http）。 */
     return start_webserver();
 }

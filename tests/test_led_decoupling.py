@@ -53,6 +53,8 @@ class LedDecouplingTests(unittest.TestCase):
             [
                 PROJECT_ROOT / "main" / "web_platform.c",
                 PROJECT_ROOT / "main" / "web_platform.h",
+                PROJECT_ROOT / "main" / "wifi_config_http.c",
+                PROJECT_ROOT / "main" / "wifi_config_http.h",
             ]
         )
         violations = matches_in(platform_sources, LED_REFERENCE)
@@ -134,18 +136,18 @@ class ComponentBoundaryTests(unittest.TestCase):
         self.assertNotIn("esp_vfs_littlefs_register", web_source)
 
     def test_wifi_config_transaction_lives_in_store(self):
-        web_source = (PROJECT_ROOT / "main" / "web_platform.c").read_text(
+        wifi_web_source = (PROJECT_ROOT / "main" / "wifi_config_http.c").read_text(
             encoding="utf-8"
         )
         store_source = (PROJECT_ROOT / "main" / "wifi_config_store.c").read_text(
             encoding="utf-8"
         )
 
-        # web_platform delegates the whole transaction to one composite API.
-        self.assertIn("wifi_config_store_apply_full(&config)", web_source)
-        self.assertNotIn("wifi_config_store_stage", web_source)
-        self.assertNotIn("wifi_config_store_commit", web_source)
-        self.assertNotIn("wifi_config_store_discard", web_source)
+        # wifi_config_http delegates the whole transaction to one composite API.
+        self.assertIn("wifi_config_store_apply_full(&config)", wifi_web_source)
+        self.assertNotIn("wifi_config_store_stage", wifi_web_source)
+        self.assertNotIn("wifi_config_store_commit", wifi_web_source)
+        self.assertNotIn("wifi_config_store_discard", wifi_web_source)
 
         # The transaction (stage -> snapshot -> apply -> commit, with rollback)
         # lives in the store.
@@ -272,7 +274,7 @@ class ComponentBoundaryTests(unittest.TestCase):
         self.assertNotIn('class="task-details"', source)
         self.assertIn("任务列表（栈剩余）", source)
 
-    def test_default_file_manager_does_not_advertise_unconfigured_sd(self):
+    def test_default_file_manager_advertises_sd_storage(self):
         web_source = (PROJECT_ROOT / "main" / "web_platform.c").read_text(
             encoding="utf-8"
         )
@@ -280,7 +282,7 @@ class ComponentBoundaryTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn(".sd_mount_point = NULL", web_source)
+        self.assertIn(".sd_mount_point = SD_CARD_DEFAULT_MOUNT_POINT", web_source)
         self.assertNotIn("OPTIONAL_SD_MOUNT_POINT", web_source)
         self.assertIn("updateOptionalStorageTabs", files_source)
         self.assertIn("tab.hidden=data.mounted!==true", files_source)
@@ -359,6 +361,33 @@ class ComponentBoundaryTests(unittest.TestCase):
                 re.DOTALL,
             ),
         )
+
+    def test_ble_host_test_is_heart_rate_demo(self):
+        source = (
+            PROJECT_ROOT / "components" / "ble_host_test" / "ble_host_test.c"
+        ).read_text(encoding="utf-8")
+        header = (
+            PROJECT_ROOT / "components" / "ble_host_test" / "ble_host_test.h"
+        ).read_text(encoding="utf-8")
+        cmake = (
+            PROJECT_ROOT / "components" / "ble_host_test" / "CMakeLists.txt"
+        ).read_text(encoding="utf-8")
+
+        # 心率广播演示：连标准 Heart Rate Service，不再扫描睡眠垫/NUS。
+        self.assertNotIn("NUS", source)
+        self.assertNotIn("睡眠", source)
+        self.assertIn("0x180D", source)   # Heart Rate Service
+        self.assertIn("0x2A37", source)   # Heart Rate Measurement
+        self.assertIn("HUAWEI Band", source)
+        # 演示任务每秒刷新一次。
+        self.assertIn("SCAN_INTERVAL_MS", source)
+        self.assertIn("1000u", source)
+        self.assertIn("pdMS_TO_TICKS(SCAN_INTERVAL_MS)", source)
+        # 只依赖 ble_host（不依赖 echo/配网）。
+        self.assertIn("ble_host", cmake)
+        self.assertNotIn("ble_echo", cmake)
+        self.assertNotIn("blufi_provisioning", cmake)
+        self.assertIn("心率", header)
 
     def test_defaults_do_not_enable_unused_runtime_features(self):
         defaults = (PROJECT_ROOT / "sdkconfig.defaults").read_text(
@@ -572,13 +601,113 @@ class ComponentBoundaryTests(unittest.TestCase):
         self.assertIn("/ota/upload/filesystem", web_source)
 
     def test_web_reports_file_existence_instead_of_false_loaded_state(self):
-        source = (PROJECT_ROOT / "main" / "web_platform.c").read_text(
+        source = (PROJECT_ROOT / "main" / "wifi_config_http.c").read_text(
             encoding="utf-8"
         )
 
         self.assertNotIn('"config_loaded"', source)
         self.assertNotIn('"loaded_from_file"', source)
         self.assertIn('"config_exists"', source)
+
+    def test_web_platform_is_app_agnostic(self):
+        web_source = (PROJECT_ROOT / "main" / "web_platform.c").read_text(
+            encoding="utf-8"
+        )
+        web_header = (PROJECT_ROOT / "main" / "web_platform.h").read_text(
+            encoding="utf-8"
+        )
+        wifi_web_source = (PROJECT_ROOT / "main" / "wifi_config_http.c").read_text(
+            encoding="utf-8"
+        )
+        main_source = (PROJECT_ROOT / "main" / "main.c").read_text(
+            encoding="utf-8"
+        )
+        cmake_source = (PROJECT_ROOT / "main" / "CMakeLists.txt").read_text(
+            encoding="utf-8"
+        )
+
+        # 平台层不直接依赖 WiFi 业务（wifi_manager / 凭据存储 / 应用身份）。
+        for header in ["wifi_manager.h", "wifi_config_store.h", "app_config.h"]:
+            self.assertNotIn(f'#include "{header}"', web_source)
+        self.assertNotIn("wifi_persisted_config_t", web_source)
+        self.assertNotIn("wifi_config_store", web_source)
+        self.assertNotIn("wifi_manager", web_source)
+
+        # 私有文件保护通过平台回调注入，策略由应用层模块安装。
+        self.assertIn("web_platform_private_path_cb_t", web_header)
+        self.assertIn("web_platform_set_private_path_cb", web_header)
+        self.assertIn("web_platform_set_private_path_cb(wifi_config_store_is_path)",
+                      wifi_web_source)
+
+        # 应用层 WiFi 端点在平台 init 之后、静态回退之前注册；
+        # 安全守卫必须先于平台 init 安装。
+        self.assertIn('#include "wifi_config_http.h"', main_source)
+        self.assertIn('"wifi_config_http.c"', cmake_source)
+        self.assertLess(
+            main_source.index("wifi_config_http_install_guards()"),
+            main_source.index("web_platform_init()"),
+        )
+        self.assertLess(
+            main_source.index("web_platform_init()"),
+            main_source.index("wifi_config_http_register(web_platform_get_server())"),
+        )
+        self.assertLess(
+            main_source.index("wifi_config_http_register(web_platform_get_server())"),
+            main_source.index("web_platform_register_static_fallback()"),
+        )
+
+    def test_static_fallback_requires_private_path_policy(self):
+        web_source = (PROJECT_ROOT / "main" / "web_platform.c").read_text(
+            encoding="utf-8"
+        )
+        wifi_web_source = (PROJECT_ROOT / "main" / "wifi_config_http.c").read_text(
+            encoding="utf-8"
+        )
+        main_source = (PROJECT_ROOT / "main" / "main.c").read_text(
+            encoding="utf-8"
+        )
+
+        # 平台 fail-fast：未安装私有路径策略时拒绝注册静态回退（模板复制
+        # 不会静默丢失私有文件保护）。
+        self.assertIn("s_private_path_cb_installed", web_source)
+        self.assertIn("s_private_path_cb_installed = true", web_source)
+        self.assertIn("ESP_ERR_INVALID_STATE", web_source)
+        self.assertIn(
+            "no private-path policy installed", web_source
+        )
+        # 守卫拆分为独立安装函数，先于平台 init 调用（关闭 httpd 启动窗口）。
+        self.assertIn("wifi_config_http_install_guards", wifi_web_source)
+        self.assertLess(
+            main_source.index("wifi_config_http_install_guards()"),
+            main_source.index("web_platform_init()"),
+        )
+        # 守卫包含 file_manager 读写守卫 + 平台静态回退策略。
+        self.assertIn("file_manager_set_read_guard(protect_wifi_config)",
+                      wifi_web_source)
+        self.assertIn("web_platform_set_private_path_cb(wifi_config_store_is_path)",
+                      wifi_web_source)
+
+    def test_registration_failures_are_fail_fast(self):
+        web_source = (PROJECT_ROOT / "main" / "web_platform.c").read_text(
+            encoding="utf-8"
+        )
+        wifi_web_source = (PROJECT_ROOT / "main" / "wifi_config_http.c").read_text(
+            encoding="utf-8"
+        )
+        main_source = (PROJECT_ROOT / "main" / "main.c").read_text(
+            encoding="utf-8"
+        )
+
+        # 平台与应用层端点的 URI 注册失败均 fail-fast：停服 + 返回错误，
+        # 由 main.c 的 ESP_ERROR_CHECK 统一处理，不存在静默缺端点。
+        self.assertIn("httpd_stop(server)", web_source)
+        self.assertIn("return reg_err", web_source)
+        self.assertLess(
+            web_source.index("httpd_stop(server)"),
+            web_source.index("return reg_err"),
+        )
+        self.assertIn("return reg_err", wifi_web_source)
+        self.assertIn("ESP_ERROR_CHECK(wifi_config_http_register", main_source)
 
     def test_wifi_config_is_blocked_from_public_file_access(self):
         store_header = (
@@ -590,17 +719,26 @@ class ComponentBoundaryTests(unittest.TestCase):
         file_source = (
             PROJECT_ROOT / "components" / "file_manager" / "file_manager.c"
         ).read_text(encoding="utf-8")
+        wifi_web_source = (PROJECT_ROOT / "main" / "wifi_config_http.c").read_text(
+            encoding="utf-8"
+        )
         web_source = (PROJECT_ROOT / "main" / "web_platform.c").read_text(
             encoding="utf-8"
         )
 
         self.assertIn("wifi_config_store_is_path", store_header)
         self.assertIn("file_manager_set_read_guard", file_header)
-        self.assertIn("file_manager_set_read_guard(protect_wifi_config)", web_source)
+        # 守卫策略由应用层 wifi_config_http 安装（平台不感知具体私有路径）。
+        self.assertIn("file_manager_set_read_guard(protect_wifi_config)", wifi_web_source)
         self.assertIn(
-            "file_manager_set_mutation_guard(protect_wifi_config)", web_source
+            "file_manager_set_mutation_guard(protect_wifi_config)", wifi_web_source
         )
-        self.assertIn("wifi_config_store_is_path(path)", web_source)
+        self.assertIn("wifi_config_store_is_path(path)", wifi_web_source)
+        self.assertNotIn("file_manager_set_read_guard", web_source)
+        # 静态文件回退通过平台回调保护私有文件。
+        self.assertIn("web_platform_set_private_path_cb(wifi_config_store_is_path)",
+                      wifi_web_source)
+        self.assertIn("s_private_path_cb(path)", web_source)
 
         mkdir_action = file_source[
             file_source.index("static esp_err_t file_manager_mkdir_action") :
@@ -617,7 +755,7 @@ class ComponentBoundaryTests(unittest.TestCase):
 
         self.assertEqual([], matches_in(platform_entrypoints, re.compile(r"sd_logger")))
 
-    def test_default_platform_does_not_start_sd_card(self):
+    def test_default_platform_starts_sd_card(self):
         main_source = (PROJECT_ROOT / "main" / "main.c").read_text(
             encoding="utf-8"
         )
@@ -625,9 +763,10 @@ class ComponentBoundaryTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertNotRegex(main_source, r'(?m)^#include\s+"sd_card\.h"$')
-        self.assertNotIn("sd_card_init()", main_source)
-        self.assertNotRegex(main_cmake, r"\bsd_card\b")
+        # 立创实战派模板默认初始化 SD 卡（SDMMC）并暴露给文件管理器。
+        self.assertRegex(main_source, r'(?m)^#include\s+"sd_card\.h"$')
+        self.assertIn("sd_card_init()", main_source)
+        self.assertRegex(main_cmake, r"\bsd_card\b")
         self.assertTrue((PROJECT_ROOT / "components" / "sd_card" / "sd_card.c").exists())
 
     def test_wifi_provisioning_example_is_json_not_compile_time_macros(self):
@@ -663,13 +802,19 @@ class ComponentBoundaryTests(unittest.TestCase):
         self.assertNotIn("const AP_PASS", index)
         self.assertIn("d.ap_password", index)
         # Platform exposes the AP password through the wifi_manager getter.
-        self.assertIn("wifi_manager_get_ap_password()", web_source)
+        wifi_web_source = (PROJECT_ROOT / "main" / "wifi_config_http.c").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("wifi_manager_get_ap_password()", web_source)
+        self.assertIn("wifi_manager_get_ap_password()", wifi_web_source)
         self.assertIn("wifi_manager_get_ap_password", (
             PROJECT_ROOT / "components" / "wifi_manager" / "wifi_manager.h"
         ).read_text(encoding="utf-8"))
         # Build id comes from the single app_config source.
         self.assertIn("#define APP_BUILD_ID", app_config)
         self.assertNotIn('"esp32s3-template-v1"', web_source)
+        self.assertIn("APP_BUILD_ID", wifi_web_source)
+        self.assertNotIn('"esp32s3-template-v1"', wifi_web_source)
 
 
 if __name__ == "__main__":

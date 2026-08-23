@@ -17,6 +17,7 @@
 #include "lcd_lvgl.h"
 #include "sd_card.h"
 #include "web_platform.h"
+#include "wifi_config_http.h"
 #include "wifi_config_store.h"
 #include "wifi_manager.h"
 #if CONFIG_BLE_ENABLED
@@ -222,8 +223,15 @@ void app_main(void)
     }
 #endif
 
+    /* ── 应用层安全策略：私有文件保护，必须先于平台服务器启动安装 ── */
+    ESP_ERROR_CHECK(wifi_config_http_install_guards());
+
     /* ── 平台基础 Web 服务（HTTP + OTA + 文件管理） ───────── */
     ESP_ERROR_CHECK(web_platform_init());
+
+    /* ── 应用层 Web 端点：WiFi 配网（/wifi_config.json + /network.json）
+     *   与业务示例一样，在平台 init 之后、静态回退之前注册。 ── */
+    ESP_ERROR_CHECK(wifi_config_http_register(web_platform_get_server()));
 
     /* ── 静态文件回退 ── 必须最后注册 ──────────────────────── */
     ESP_ERROR_CHECK(web_platform_register_static_fallback());

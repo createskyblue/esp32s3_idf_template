@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.c" "web_platform.c"
+idf_component_register(SRCS "wifi_config_http.c" "main.c" "web_platform.c"
                          "app_storage.c" "wifi_config_store.c"
                     INCLUDE_DIRS "."
                     REQUIRES json wifi_manager ota_manager file_manager led_task cjson ble_host blufi_provisioning ble_echo ble_host_test lcd_lvgl sd_card

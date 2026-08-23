@@ -175,8 +175,11 @@ idf.py -p COMx flash monitor
 项目采用 **平台 + 业务** 分层架构：
 
 1. `main/main.c` — 启动编排，先挂载 LittleFS、加载 JSON，再把凭据传给 WiFi
-2. `main/web_platform.c` — HTTP / OTA / 配网 / 仪表盘
-3. `main/hello_web.c/.h` — 可选业务端点示例；需要时再加入默认构建
+2. `main/web_platform.c` — HTTP 平台：静态文件 / OTA / 仪表盘（应用无关）
+3. `main/wifi_config_http.c` — 应用层 WiFi 配网页端点（业务端点的活示例）
+4. `main/hello_web.c/.h` — 可选业务端点示例；需要时再加入默认构建
+
+**平台与业务的分界**：`web_platform` 只提供 HTTP 服务器、静态文件回退、OTA 与文件管理，不感知任何 WiFi 业务；配网页端点、凭据字段校验与私有文件保护策略都放在应用层 `wifi_config_http`（通过 `web_platform_set_private_path_cb` 回调告知平台哪些文件不可公开）。保护策略由 `wifi_config_http_install_guards()` 在平台服务器启动**之前**安装；若未安装策略，`web_platform_register_static_fallback()` 会拒绝注册（fail-fast），防止复制模板后静默丢失私有文件保护。
 
 **启用示例端点并添加自定义业务：**
 
@@ -217,7 +220,9 @@ cp main/wifi_config.example.json data/wifi_config.json
 
 配网时下发 STA 凭据，经 `wifi_config_store_apply_credentials` 落地（应用 + 原子持久化 + 失败回滚），与 Web 配网共用同一套凭据与持久化路径。WiFi 模式保持 APSTA（由 `wifi_manager` 统一管理），BLE 常开以便随时（重新）配网。
 
-BLE 由两个编译开关控制：**`CONFIG_BLE_ENABLED`**（BLE 总开关，NimBLE host，由 `ble_host` 组件统一拉起）+ **`CONFIG_BLUFI_PROVISIONING_ENABLED`**（配网功能，依赖 BLE）。两者默认都在 `sdkconfig.defaults` 中为 `y`。开启会引入 **NimBLE（BLE-only）栈，常驻约 40 KB SRAM**；若板子不需要 BLE，将两者置 `n` 可把蓝牙栈整体剔除、回收这部分内存。
+BLE 由两个编译开关控制：**`CONFIG_BLE_ENABLED`**（BLE 总开关，NimBLE host，由 `ble_host` 组件统一拉起）+ **`CONFIG_BLUFI_PROVISIONING_ENABLED`**（配网功能，依赖 BLE）。两者在 `sdkconfig.defaults` 中默认为 `n`（立创实战派屏幕/LVGL 需要内存，默认关闭蓝牙栈）；开启会引入 **NimBLE（BLE-only）栈，常驻约 40 KB SRAM**，可在 menuconfig 中按需开启。
+
+**BLE 心率广播演示**：`ble_host_test` 组件（随 `CONFIG_BLE_ENABLED` 编译）扫描带心率服务(0x180D)或名字含 `HUAWEI Band` 的设备（华为手环开启心率广播后名字形如 `HUAWEI Band HR-XXXX`），连接后订阅 Heart Rate Measurement 特征(0x2A37)并解析打印心率；未连接时每秒自动重试扫描。
 
 ### 可选启用 SD 卡
 
