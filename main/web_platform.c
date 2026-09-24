@@ -18,7 +18,12 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/freertos_debug.h"
 #include "freertos/task.h"
+
+/* ESP-IDF 内部扩展(esp_additions), 未在公开头文件导出, 这里显式声明:
+ * 返回任务栈底地址(pxStack, 最低地址), 用于计算当前栈剩余 */
+extern StackType_t * xTaskGetStackStart( TaskHandle_t xTask );
 
 /* ── constants ─────────────────────────────────────────────────────────── */
 #define LITTLEFS_INDEX_PATH          APP_LITTLEFS_BASE_PATH "/index.html"
@@ -225,16 +230,78 @@ static esp_err_t debug_json_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "psram_total_heap", psram_total);
     cJSON_AddNumberToObject(root, "psram_used_heap", psram_used);
     cJSON_AddNumberToObject(root, "psram_free_heap", psram_free);
+    cJSON_AddNumberToObject(root, "psram_min_free_heap",
+                            heap_caps_get_minimum_free_size(psram_caps));
 
 #if configUSE_TRACE_FACILITY && configUSE_STATS_FORMATTING_FUNCTIONS
-    char *task_buf = malloc(2048);
-    if (task_buf != NULL) {
-        int hdr = snprintf(task_buf, 2048,
-                           "名称            状态  优先级  栈剩余  序号\r\n"
-                           "------------------------------------------------\r\n");
-        if (hdr > 0 && hdr < 2048) vTaskList(task_buf + hdr);
-        cJSON_AddStringToObject(root, "task_list", task_buf);
-        free(task_buf);
+    /* 每个任务一行: 名称/状态/优先级/当前栈剩余/历史最低栈剩余/栈大小。
+     * 当前栈剩余来自官方 freertos_debug.h 快照(pxTopOfStack)与
+     * xTaskGetStackStart()(栈底); 历史最低(HWM)来自 uxTaskGetStackHighWaterMark。 */
+    TaskIterator_t task_it = {0};
+    cJSON *tasks = cJSON_AddArrayToObject(root, "tasks");
+    /* 任务枚举加固: xTaskGetNext 遍历期间若任务被创建/删除(业务临时任务自删),
+     * 迭代器可能卡在某个任务列表上反复返回同一批任务, 造成:
+     *  1) 同一任务被输出几百行  2) cJSON 分配不释放, 内部堆被打到只剩 16B,
+     *     严重时设备无响应/重启。修复: 按任务句柄去重 + 迭代兜底, 保证每任务
+     *     只输出一行且不耗尽内存。 */
+    TaskHandle_t seen[64];
+    int seen_cnt = 0;
+    int guard = 0;
+    while (xTaskGetNext(&task_it) >= 0) {
+        TaskHandle_t h = task_it.pxTaskHandle;
+        if (h == NULL) {
+            continue;
+        }
+        if (++guard > 512) {
+            break;   /* 迭代器异常(任务列表并发修改)时的总兜底 */
+        }
+        int dup = 0;
+        for (int i = 0; i < seen_cnt; i++) {
+            if (seen[i] == h) {
+                dup = 1;
+                break;
+            }
+        }
+        if (dup) {
+            continue;
+        }
+        if (seen_cnt < (int)(sizeof(seen) / sizeof(seen[0]))) {
+            seen[seen_cnt++] = h;
+        }
+        uint32_t cur_free = 0;
+        uint32_t stack_size_bytes = 0;
+        TaskSnapshot_t snap;
+        const StackType_t *stack_start = xTaskGetStackStart(h);
+        if (vTaskGetSnapshot(h, &snap) == pdTRUE && stack_start != NULL) {
+            /* xtensa 栈向下增长: pxStack=栈底(低地址), pxTopOfStack=当前SP,
+             * 当前剩余 = SP - 栈底; 栈大小 = 栈顶(pxEndOfStack) - 栈底 + 1 */
+            if (snap.pxTopOfStack >= stack_start && snap.pxEndOfStack >= stack_start) {
+                cur_free = (uint32_t)((const char *)snap.pxTopOfStack -
+                                      (const char *)stack_start);
+                stack_size_bytes = (uint32_t)((const char *)snap.pxEndOfStack -
+                                              (const char *)stack_start) + 1u;
+            }
+        }
+        const char *st;
+        switch (eTaskGetState(h)) {
+        case eRunning:   st = "R"; break;
+        case eReady:     st = "R"; break;
+        case eBlocked:   st = "B"; break;
+        case eSuspended: st = "S"; break;
+        case eDeleted:   st = "D"; break;
+        default:         st = "?"; break;
+        }
+        cJSON *t = cJSON_CreateObject();
+        if (t == NULL) {
+            break;
+        }
+        cJSON_AddStringToObject(t, "name", pcTaskGetName(h));
+        cJSON_AddStringToObject(t, "state", st);
+        cJSON_AddNumberToObject(t, "priority", (double)uxTaskPriorityGet(h));
+        cJSON_AddNumberToObject(t, "current_stack_free", (double)cur_free);
+        cJSON_AddNumberToObject(t, "min_stack_free", (double)uxTaskGetStackHighWaterMark(h));
+        cJSON_AddNumberToObject(t, "stack_size", (double)stack_size_bytes);
+        cJSON_AddItemToArray(tasks, t);
     }
 #else
     cJSON_AddStringToObject(root, "task_list",
@@ -296,10 +363,10 @@ static esp_err_t start_webserver(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 24;   /* 平台5+wifi3+文件3+OTA4+截图1+回退1 ≈ 17 */
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.lru_purge_enable = true;
-    config.stack_size = 16384;
+    config.stack_size = 12288;   /* 实测当前使用仅 ~4KB, 砍到 12KB 留余量 */
 
     httpd_handle_t server = NULL;
     const esp_err_t httpd_err = httpd_start(&server, &config);

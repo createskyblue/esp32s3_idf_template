@@ -71,6 +71,18 @@
     .ms-label{color:var(--faint)}
     .ms-val{color:var(--muted);font-weight:600}
     .task-label{margin-top:20px;margin-bottom:8px;color:var(--muted);font-size:13px;font-weight:600}
+    .task-table{width:100%;border-collapse:collapse;font-size:12.5px;margin-bottom:4px}
+    .task-table th,.task-table td{padding:7px 10px;text-align:left;border-bottom:1px solid var(--line)}
+    .task-table th{color:var(--muted);font-weight:600;background:#F8FAFC}
+    .task-table th.sortable{cursor:pointer;user-select:none}
+    .task-table th.sortable:hover{color:var(--primary)}
+    .task-table th.sorted{color:var(--primary)}
+    .task-table td:first-child{font-family:ui-monospace,Consolas,monospace}
+    .task-table td:nth-child(4){color:var(--primary);font-weight:600}
+    .task-table td:nth-child(5){color:var(--err);font-weight:600}
+    .pct-danger{color:#DC2626;font-weight:700}
+    .pct-warn{color:#D97706;font-weight:700}
+    .pct-ok{color:#16A34A;font-weight:700}
     pre{white-space:pre-wrap;background:#0F172A;color:#94A3B8;border-radius:var(--radius-md);padding:16px;font-size:12.5px;line-height:1.65;overflow-x:auto}
     .build-info{margin-top:12px;font-size:12px;color:var(--faint)}
     .ota-form{display:grid;grid-template-columns:1fr 1fr auto;gap:12px;align-items:end;margin-bottom:14px}
@@ -90,6 +102,7 @@
       <div class="subtitle">WiFi 配网 · 文件管理 · OTA 升级</div>
     </div>
     <div class="actions">
+      <button onclick="takeScreenshot()">📷 截图</button>
       <button onclick="location.href='/files'">📁 文件管理</button>
       <button onclick="location.reload()">🔄 刷新</button>
       <button class="danger" onclick="rebootDevice()">⚠️ 重启</button>
@@ -188,10 +201,23 @@
           <div class="mem-bar" id="psram-bar-wrap"><span id="psram-bar"></span></div>
           <span class="mem-pct" id="psram-pct">--</span>
         </div>
+        <div class="mem-sub">
+          <div><span class="ms-label">历史最低剩余</span><span class="ms-val" id="psram-min-heap">--</span></div>
+        </div>
       </div>
     </div>
-    <div class="task-label">任务列表（栈剩余）</div>
-    <pre id="task-list">任务列表加载中...</pre>
+    <div class="task-label">任务列表（点击表头排序 · 历史最低剩余% 越低越危险，&lt;30% 红 / 30-60% 黄 / &gt;60% 绿）</div>
+    <table class="task-table">
+      <thead><tr>
+        <th class="sortable" data-key="name">名称 <span class="sort-ind"></span></th>
+        <th class="sortable" data-key="state">状态 <span class="sort-ind"></span></th>
+        <th class="sortable" data-key="priority">优先级 <span class="sort-ind"></span></th>
+        <th class="sortable" data-key="current_stack_free">当前栈剩余 <span class="sort-ind"></span></th>
+        <th class="sortable" data-key="min_stack_free">历史最低栈剩余 <span class="sort-ind"></span></th>
+        <th class="sortable" data-key="min_stack_pct">历史最低剩余% <span class="sort-ind"></span></th>
+      </tr></thead>
+      <tbody id="task-tbody"><tr><td colspan="6">加载中...</td></tr></tbody>
+    </table>
     <div class="build-info">固件: <span id="build-id">--</span> · 构建时间: <span id="build-ts">--</span></div>
   </div>
 
@@ -218,6 +244,17 @@
     <div class="modal-title" id="net-modal-title"></div>
     <div class="modal-body" id="net-modal-text"></div>
     <button class="primary" type="button" onclick="closeNetModal()">确定</button>
+  </div>
+</div>
+
+<!-- LCD 截图预览弹窗(调试/文档用) -->
+<div id="shotModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:99;align-items:center;justify-content:center;flex-direction:column;padding:16px">
+  <img id="shotImg" alt="LCD 截图" style="max-width:92vw;max-height:78vh;border-radius:8px;background:#222;box-shadow:0 8px 40px rgba(0,0,0,.5)">
+  <div style="margin-top:14px;display:flex;gap:10px;align-items:center">
+    <button onclick="closeShot()">关闭</button>
+    <a id="shotDownload" download="lcd_screenshot.bmp"
+       style="text-decoration:none;padding:9px 16px;border-radius:8px;background:var(--primary-bg);color:var(--primary-deep);font-weight:600">⬇ 下载 BMP</a>
+    <span style="color:#fff;font-size:12px;opacity:.7">调试功能 · 截取 LCD 当前画面</span>
   </div>
 </div>
 
@@ -271,6 +308,51 @@ function formatUptime(ms) {
   if (m > 0) return m + 'm ' + (s % 60) + 's';
   return s + 's';
 }
+
+/* ── task list: current + min stack free + pct, sortable columns ───── */
+let gSortKey = 'min_stack_pct';   /* 默认按历史最低剩余%升序: 最危险的在最上面 */
+let gSortDir = 1;                  /* 1=升序 -1=降序 */
+
+function pctClass(p) { return p < 30 ? 'pct-danger' : (p < 60 ? 'pct-warn' : 'pct-ok'); }
+
+function renderTasks() {
+  const tb = document.getElementById('task-tbody');
+  if (!tb) return;
+  if (!Array.isArray(window.__tasks) || !window.__tasks.length) {
+    tb.innerHTML = '<tr><td colspan="6">无任务信息</td></tr>';
+    return;
+  }
+  const rows = window.__tasks.map(t => {
+    const stack = t.stack_size || 1;
+    const curPct = Math.round(t.current_stack_free / stack * 100);
+    const minPct = Math.round(t.min_stack_free / stack * 100);
+    return Object.assign({}, t, { current_stack_pct: curPct, min_stack_pct: minPct });
+  }).sort((a, b) => {
+    const va = a[gSortKey], vb = b[gSortKey];
+    if (typeof va === 'string') return gSortDir * va.localeCompare(vb || '');
+    return gSortDir * ((va || 0) - (vb || 0));
+  });
+  tb.innerHTML = rows.map(t => `<tr><td>${t.name}</td><td>${t.state}</td><td>${t.priority}</td>` +
+                              `<td>${t.current_stack_free} B</td><td>${t.min_stack_free} B</td>` +
+                              `<td class="${pctClass(t.min_stack_pct)}">${t.min_stack_pct}%</td></tr>`).join('');
+  document.querySelectorAll('th.sortable').forEach(th => {
+    const ind = th.querySelector('.sort-ind');
+    if (ind) ind.textContent = (th.dataset.key === gSortKey) ? (gSortDir === 1 ? ' ▲' : ' ▼') : '';
+    th.classList.toggle('sorted', th.dataset.key === gSortKey);
+  });
+}
+
+document.querySelectorAll('th.sortable').forEach(th => {
+  th.addEventListener('click', () => {
+    if (gSortKey === th.dataset.key) {
+      gSortDir *= -1;   /* 同列再点: 切换升降序 */
+    } else {
+      gSortKey = th.dataset.key;
+      gSortDir = 1;     /* 新列: 默认升序 */
+    }
+    renderTasks();
+  });
+});
 
 /* ── network + system refresh ──────────────────────────────────────── */
 /* A live 5s refresh must not clobber a value the user is currently editing. */
@@ -332,8 +414,11 @@ async function refresh() {
     document.getElementById('internal-min-heap').textContent = formatBytes(d.internal_min_free_heap);
     document.getElementById('internal-largest-block').textContent = formatBytes(d.internal_largest_free_block);
     renderUsage('psram', d.psram_used_heap, d.psram_total_heap, d.psram_free_heap);
+    document.getElementById('psram-min-heap').textContent = formatBytes(d.psram_min_free_heap);
     document.getElementById('debug-uptime').textContent = '运行时间 ' + formatUptime(d.uptime_ms);
-    document.getElementById('task-list').textContent = d.task_list || '(无任务信息)';
+    /* 任务列表: 当前 + 历史最低栈剩余 + 百分比, 表头点击排序 */
+    window.__tasks = Array.isArray(d.tasks) ? d.tasks : [];
+    renderTasks();
   } catch(e) { console.error('debug', e); }
 
   try {
@@ -614,6 +699,32 @@ async function startOta() {
 restoreOtaUrls();
 refresh();
 setInterval(refresh, 5000);
+
+/* ── LCD 截图(调试/文档) ──────────────────────────────────────────── */
+async function takeScreenshot() {
+  const btn = document.querySelector('.actions button');
+  const old = btn ? btn.textContent : '';
+  try {
+    if (btn) btn.textContent = '⏳ 截图中...';
+    const resp = await fetch('/screenshot');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    document.getElementById('shotImg').src = url;
+    document.getElementById('shotDownload').href = url;
+    document.getElementById('shotModal').style.display = 'flex';
+  } catch (e) {
+    alert('截图失败: ' + e.message);
+  } finally {
+    if (btn) btn.textContent = old;
+  }
+}
+function closeShot() {
+  document.getElementById('shotModal').style.display = 'none';
+}
+document.getElementById('shotModal').addEventListener('click', function(e) {
+  if (e.target === this) closeShot();
+});
 </script>
 </body>
 </html>

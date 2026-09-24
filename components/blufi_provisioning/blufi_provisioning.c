@@ -144,7 +144,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         break;
     case WIFI_EVENT_SCAN_DONE:
         send_wifi_list();
-        wifi_manager_resume_sta();   /* 扫描完成，恢复 STA 自动重连 */
+        /* 不在此恢复 STA：会话级挂起直到 BLE_DISCONNECT，
+         * 保证 notify 在安静的无线环境下发射。 */
         break;
     default:
         break;
@@ -190,9 +191,10 @@ static void blufi_event_cb(esp_blufi_cb_event_t event, esp_blufi_cb_param_t *par
         esp_blufi_adv_stop();
         blufi_security_init();
         memset(&s_pending_creds, 0, sizeof(s_pending_creds));
-        /* 挂起 STA 的时机在 GET_WIFI_LIST（手机明确请求扫描）时，
-         * 由 wifi_manager_suspend_sta()/resume_sta() 按扫描生命周期管理；
-         * 普通自动重连保持不受影响。 */
+        /* 整个配网会话期间挂起 STA 重连：让出 2.4G 无线给 BLE，避免
+         * STA 反复连接不可达 AP 时 Wi-Fi/BT 共存争抢把通知挤掉。
+         * 会话结束（BLE_DISCONNECT）时再恢复。 */
+        wifi_manager_suspend_sta();
         break;
     case ESP_BLUFI_EVENT_BLE_DISCONNECT:
         ESP_LOGI(TAG, "BLE disconnected");
@@ -200,6 +202,7 @@ static void blufi_event_cb(esp_blufi_cb_event_t event, esp_blufi_cb_param_t *par
         s_sta_is_connecting = false;
         blufi_security_deinit();
         esp_blufi_adv_start();
+        wifi_manager_resume_sta();   /* 会话结束，恢复 STA 自动重连 */
         break;
     case ESP_BLUFI_EVENT_SET_WIFI_OPMODE:
         /* 保持 APSTA：WiFi 模式由 wifi_manager 统一决定 */
@@ -295,8 +298,10 @@ static void blufi_event_cb(esp_blufi_cb_event_t event, esp_blufi_cb_param_t *par
     }
     case ESP_BLUFI_EVENT_GET_WIFI_LIST: {
         ESP_LOGI(TAG, "phone requests WiFi list; starting scan");
-        /* 手机明确请求扫描：临时挂起 STA（connecting 状态会阻塞
-         * esp_wifi_scan_start），扫描结束（SCAN_DONE）后立即恢复。 */
+        /* 确保扫描期间 STA 不在 connecting 状态（会阻塞 esp_wifi_scan_start）。
+         * 会话级挂起在 BLE_CONNECT 已做，这里重复调用是幂等兜底。
+         * 注意：不再在此恢复 STA——整个配网会话结束（BLE_DISCONNECT）才恢复，
+         * 避免 notify 发射期间 STA 抢占 2.4G 无线。 */
         wifi_manager_suspend_sta();
         wifi_scan_config_t scan_cfg = {
             .ssid = NULL,
@@ -306,7 +311,6 @@ static void blufi_event_cb(esp_blufi_cb_event_t event, esp_blufi_cb_param_t *par
             .scan_type = WIFI_SCAN_TYPE_ACTIVE,
         };
         if (esp_wifi_scan_start(&scan_cfg, false) != ESP_OK) {
-            wifi_manager_resume_sta();   /* 启动失败立即恢复 */
             esp_blufi_send_error_info(ESP_BLUFI_WIFI_SCAN_FAIL);
         }
         break;

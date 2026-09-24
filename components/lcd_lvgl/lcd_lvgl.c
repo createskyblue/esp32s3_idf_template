@@ -1,7 +1,9 @@
 #include "lcd_lvgl.h"
 
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
+#include <inttypes.h>
 
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
@@ -20,7 +22,9 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lvgl.h"
-#include "demos/lv_demos.h"
+#include "src/font/binfont_loader/lv_binfont_loader.h"
+#include "lv_fs_littlefs.h"
+#include "wifi_manager.h"
 
 /* ═══════════════ 立创实战派 ESP32-S3 引脚定义 ═══════════════ */
 
@@ -193,6 +197,219 @@ static esp_err_t lcd_cs_set(bool level)
     return pca9557_write_byte(PCA9557_OUTPUT_PORT, data);
 }
 
+/* ═══════════════ shared bus + PA (audio BSP hooks) ═══════════════ */
+
+i2c_master_bus_handle_t lcd_lvgl_get_i2c_bus(void)
+{
+    return s_i2c_bus;
+}
+
+esp_err_t lcd_lvgl_pa_enable(bool enable)
+{
+    if (s_pca9557_dev == NULL) {
+        ESP_LOGE(TAG, "PA: PCA9557 not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+    uint8_t data = 0;
+    ESP_RETURN_ON_ERROR(pca9557_read_byte(PCA9557_OUTPUT_PORT, &data),
+                        TAG, "PA: PCA9557 read failed");
+    if (enable) {
+        data |= PCA9557_PA_EN_BIT;
+    } else {
+        data &= (uint8_t)~PCA9557_PA_EN_BIT;
+    }
+    ESP_RETURN_ON_ERROR(pca9557_write_byte(PCA9557_OUTPUT_PORT, data),
+                        TAG, "PA: PCA9557 write failed");
+    ESP_LOGI(TAG, "PA %s", enable ? "ON" : "OFF");
+    return ESP_OK;
+}
+
+/* ═══════════════ CJK 字体(文件系统加载, 无则回退内置) ═══════════════ */
+static lv_font_t *s_ui_asr_font = NULL;
+
+/* ═══════════════ 演示屏(替代官方 widget demo) ═══════════════
+ * 回流自 ESP32S3_VoiceInput 的设置屏并精简: 演示 CJK 字体渲染、
+ * 屏幕方向即时切换(面板 MADCTL + 触摸手动映射)与 WiFi/IP 显示(500ms 节流)。 */
+
+static lv_display_t *s_disp = NULL;   /* display task 创建后保存 */
+static int s_orientation = 0;         /* 0/1/2/3 = 0/90/180/270 度 */
+static lv_obj_t *s_demo_scr = NULL;
+static lv_obj_t *s_ori_btns[4] = { NULL };  /* 4 个方向按钮 */
+static lv_obj_t *s_demo_wifi_lbl = NULL;    /* 当前 WiFi 名称 */
+static lv_obj_t *s_demo_ip_lbl = NULL;      /* 当前 IP 地址 */
+static bool s_demo_loaded = false;
+static uint32_t s_demo_net_last_refresh_us = 0;  /* 网络信息刷新节流 */
+
+/* 截图请求结构: display task 每帧轮询消费, 实现见 public API 前 */
+typedef struct {
+    SemaphoreHandle_t done;
+    uint8_t *out;
+    size_t out_cap;
+    int w, h;
+    esp_err_t result;
+} screenshot_req_t;
+static screenshot_req_t *s_shot_req = NULL;   /* 待处理截图请求 */
+static void screenshot_execute(void);         /* 定义在 public API 前 */
+
+/* LVGL 旋转保持 0(禁用其自动触摸变换, 触摸由我们手动映射), 仅交换分辨率实现
+ * 布局自适应; 面板 MADCTL 配合(基态 swap=true, mirror(true,false)) */
+static void demo_apply_rotation(void)
+{
+    if (s_disp == NULL) {
+        return;
+    }
+    const int o = s_orientation;
+    const int idx = (o >= 0 && o <= 3) ? o : 0;
+    lv_display_set_rotation(s_disp, LV_DISPLAY_ROTATION_0);
+    if (idx == 1 || idx == 3) {
+        lv_display_set_resolution(s_disp, LCD_V_RES, LCD_H_RES);   /* 竖屏 240x320 */
+    } else {
+        lv_display_set_resolution(s_disp, LCD_H_RES, LCD_V_RES);   /* 横屏 320x240 */
+    }
+    switch (idx) {
+    case 0:
+        esp_lcd_panel_swap_xy(s_panel, true);
+        esp_lcd_panel_mirror(s_panel, true, false);
+        break;
+    case 1:   /* 90° */
+        esp_lcd_panel_swap_xy(s_panel, false);
+        esp_lcd_panel_mirror(s_panel, true, true);
+        break;
+    case 2:   /* 180° */
+        esp_lcd_panel_swap_xy(s_panel, true);
+        esp_lcd_panel_mirror(s_panel, false, true);
+        break;
+    default:  /* 270° */
+        esp_lcd_panel_swap_xy(s_panel, false);
+        esp_lcd_panel_mirror(s_panel, false, false);
+        break;
+    }
+    ESP_LOGI(TAG, "orientation=%d applied", idx);
+}
+
+static void demo_ori_cb(lv_event_t *e)
+{
+    const int o = (int)(intptr_t)lv_event_get_user_data(e);
+    s_orientation = o;
+    demo_apply_rotation();
+    /* 高亮当前方向 */
+    for (int i = 0; i < 4; i++) {
+        if (s_ori_btns[i] != NULL) {
+            lv_obj_set_style_bg_color(s_ori_btns[i],
+                i == o ? lv_color_hex(0x07C160) : lv_color_hex(0x3A4654), 0);
+        }
+    }
+}
+
+/* 刷新演示屏网络信息: WiFi 名称 + IP 地址(由显示任务调用)。
+ * STA 未连接时显示 AP 地址, 用户仍可凭它访问配网页。 */
+static void demo_refresh_network_info(void)
+{
+    if (s_demo_wifi_lbl == NULL || s_demo_ip_lbl == NULL) {
+        return;
+    }
+    char buf[80];
+    if (!wifi_manager_is_started()) {
+        lv_label_set_text(s_demo_wifi_lbl, "WiFi: 初始化中");
+        lv_label_set_text(s_demo_ip_lbl, "IP: --");
+        return;
+    }
+    wifi_snapshot_t snap;
+    wifi_manager_get_snapshot(&snap);
+    if (snap.sta_connected) {
+        snprintf(buf, sizeof(buf), "WiFi: %s", snap.sta_ssid);
+        lv_label_set_text(s_demo_wifi_lbl, buf);
+        snprintf(buf, sizeof(buf), "IP: %s", snap.sta_ip);
+    } else {
+        lv_label_set_text(s_demo_wifi_lbl, "WiFi: 未连接");
+        snprintf(buf, sizeof(buf), "IP: %s (AP)", snap.ap_ip);
+    }
+    lv_label_set_text(s_demo_ip_lbl, buf);
+}
+
+/* 500ms 节流: 其余时间零开销 */
+static void demo_network_refresh_if_active(void)
+{
+    if (s_demo_scr == NULL || lv_screen_active() != s_demo_scr) {
+        return;
+    }
+    const uint64_t now = esp_timer_get_time();
+    if (now - s_demo_net_last_refresh_us < 500000ULL) {
+        return;
+    }
+    s_demo_net_last_refresh_us = (uint32_t)now;
+    demo_refresh_network_info();
+}
+
+static void ui_apply(void)
+{
+    demo_network_refresh_if_active();
+    if (s_demo_scr != NULL && !s_demo_loaded) {
+        s_demo_loaded = true;
+        lv_screen_load(s_demo_scr);
+        ESP_LOGI(TAG, "demo screen loaded");
+    }
+}
+
+static void demo_screen_create(void)
+{
+    s_demo_scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(s_demo_scr, lv_color_hex(0x101418), 0);
+    lv_obj_set_style_bg_opa(s_demo_scr, LV_OPA_COVER, 0);   /* 显式完全不透明 */
+    lv_obj_set_size(s_demo_scr, lv_display_get_horizontal_resolution(s_disp),
+                    lv_display_get_vertical_resolution(s_disp));   /* 显式全屏尺寸 */
+
+    lv_obj_t *title = lv_label_create(s_demo_scr);
+    lv_label_set_text(title, "设置");
+    lv_obj_set_style_text_font(title, s_ui_asr_font, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0x9AC8FF), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 14);
+
+    /* 屏幕方向 2x2 */
+    lv_obj_t *ori_lbl = lv_label_create(s_demo_scr);
+    lv_label_set_text(ori_lbl, "屏幕方向");
+    lv_obj_set_style_text_font(ori_lbl, s_ui_asr_font, 0);
+    lv_obj_set_style_text_color(ori_lbl, lv_color_hex(0xE8E8E8), 0);
+    lv_obj_align(ori_lbl, LV_ALIGN_TOP_LEFT, 24, 60);
+    static const char *ori_names[4] = { "0°", "90°", "180°", "270°" };
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t *b = lv_button_create(s_demo_scr);
+        lv_obj_set_size(b, 60, 32);
+        lv_obj_align(b, LV_ALIGN_TOP_LEFT, 24 + (i % 2) * 72, 84 + (i / 2) * 42);
+        lv_obj_set_style_radius(b, 8, 0);
+        lv_obj_set_style_bg_color(b, lv_color_hex(0x3A4654), 0);
+        lv_obj_add_event_cb(b, demo_ori_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        lv_obj_t *bl = lv_label_create(b);
+        lv_label_set_text(bl, ori_names[i]);
+        lv_obj_set_style_text_font(bl, s_ui_asr_font, 0);
+        lv_obj_set_style_text_color(bl, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_center(bl);
+        s_ori_btns[i] = b;
+    }
+
+    /* 当前网络信息: WiFi 名称在上, IP 地址在下 */
+    lv_obj_t *wifi_lbl = lv_label_create(s_demo_scr);
+    lv_label_set_text(wifi_lbl, "WiFi: --");
+    lv_obj_set_style_text_font(wifi_lbl, s_ui_asr_font, 0);
+    lv_obj_set_style_text_color(wifi_lbl, lv_color_hex(0x9AC8FF), 0);
+    lv_obj_align(wifi_lbl, LV_ALIGN_TOP_LEFT, 24, 200);
+    s_demo_wifi_lbl = wifi_lbl;
+
+    lv_obj_t *ip_lbl = lv_label_create(s_demo_scr);
+    lv_label_set_text(ip_lbl, "IP: --");
+    lv_obj_set_style_text_font(ip_lbl, s_ui_asr_font, 0);
+    lv_obj_set_style_text_color(ip_lbl, lv_color_hex(0xE8E8E8), 0);
+    lv_obj_align(ip_lbl, LV_ALIGN_TOP_LEFT, 24, 218);
+    s_demo_ip_lbl = ip_lbl;
+
+    demo_refresh_network_info();
+    for (int i = 0; i < 4; i++) {
+        if (s_ori_btns[i] != NULL) {
+            lv_obj_set_style_bg_color(s_ori_btns[i],
+                i == s_orientation ? lv_color_hex(0x07C160) : lv_color_hex(0x3A4654), 0);
+        }
+    }
+}
 /* ═══════════════ LEDC backlight ═══════════════ */
 
 static esp_err_t bsp_display_backlight_init(void)
@@ -356,21 +573,66 @@ static void lcd_flush_cb(lv_display_t *disp, const lv_area_t *area,
 /* ═══════════════ FT5x06 电容触摸（立创实战派触摸屏，与 LCD 同 I2C 总线）═══════════ */
 
 static esp_lcd_touch_handle_t s_touch = NULL;
+static esp_lcd_touch_point_data_t s_touch_cached[2];  /* 已旋转映射, 供 LVGL indev 消费 */
+static uint8_t s_touch_cached_n = 0;
 
-/* LVGL 轮询读取触摸点（LV_OS_NONE：read_cb 运行在 display 任务上下文，天然线程安全） */
-static void touch_read_cb(lv_indev_t *drv, lv_indev_data_t *data)
+/* 触摸手动映射: 0° 原样; 旋转后按面板 MADCTL 方向换算(LVGL rotation 保持 0) */
+static void map_touch_point(const esp_lcd_touch_point_data_t *in, esp_lcd_touch_point_data_t *out)
 {
-    (void)drv;
+    const int32_t rx = in->x;
+    const int32_t ry = in->y;
+    switch (s_orientation) {
+    case 1:   /* 90° */
+        out->x = (uint16_t)ry;
+        out->y = (uint16_t)(LCD_H_RES - 1 - rx);
+        break;
+    case 2:   /* 180° */
+        out->x = (uint16_t)(LCD_H_RES - 1 - rx);
+        out->y = (uint16_t)(LCD_V_RES - 1 - ry);
+        break;
+    case 3:   /* 270° */
+        out->x = (uint16_t)(LCD_V_RES - 1 - ry);
+        out->y = (uint16_t)rx;
+        break;
+    default:  /* 0° */
+        out->x = (uint16_t)rx;
+        out->y = (uint16_t)ry;
+        break;
+    }
+}
+
+/* 主循环触摸采样(约 200Hz): 读 I2C → 旋转映射 → 缓存给 LVGL + 触控板手势。
+ * 原来由 LVGL indev 定时器驱动(LV_DEF_REFR_PERIOD=16ms ≈ 62Hz), 触控板滑动明显卡顿;
+ * 改为显示主循环 5ms 轮询后, 手势增量更细更平滑。 */
+static void touch_poll(void)
+{
     if (s_touch == NULL) {
-        data->state = LV_INDEV_STATE_REL;
+        s_touch_cached_n = 0;
         return;
     }
     esp_lcd_touch_read_data(s_touch);
-    esp_lcd_touch_point_data_t pts[1];
+    esp_lcd_touch_point_data_t pts[2];
     uint8_t n = 0;
-    if (esp_lcd_touch_get_data(s_touch, pts, &n, 1) == ESP_OK && n > 0) {
-        data->point.x = pts[0].x;
-        data->point.y = pts[0].y;
+    if (esp_lcd_touch_get_data(s_touch, pts, &n, 2) == ESP_OK && n > 0) {
+        uint8_t m = 0;
+        for (uint8_t i = 0; i < n && i < 2; i++) {
+            map_touch_point(&pts[i], &s_touch_cached[i]);
+            m++;
+        }
+        s_touch_cached_n = m;
+    } else {
+        s_touch_cached_n = 0;
+    }
+}
+
+/* LVGL 轮询读取触摸点（LV_OS_NONE：read_cb 运行在 display 任务上下文，天然线程安全）
+ * 消费主循环缓存的采样, 自身不做 I2C 读取 */
+static void touch_read_cb(lv_indev_t *drv, lv_indev_data_t *data)
+{
+    (void)drv;
+    if (s_touch_cached_n > 0) {
+        data->point.x = s_touch_cached[0].x;
+        data->point.y = s_touch_cached[0].y;
         data->state = LV_INDEV_STATE_PRESSED;
     } else {
         data->state = LV_INDEV_STATE_REL;
@@ -501,6 +763,7 @@ static void display_task(void *arg)
     lv_tick_set_cb(lv_tick_get_ms);
 
     lv_display_t *disp = lv_display_create(LCD_H_RES, LCD_V_RES);
+    s_disp = disp;   /* 设置屏旋转用 */
     /* Render directly in ST7789-native byte order (big-endian RGB565):
      * removes the per-pixel byte-swap loop in the flush callback. */
     lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565_SWAPPED);
@@ -522,13 +785,26 @@ static void display_task(void *arg)
                  esp_err_to_name(cb_err));
     }
 
+    /* PARTIAL 渲染模式(不动底层 buffer/驱动); 旋转暂存设置不实际旋转 */
     lv_display_set_buffers(disp, buf1, buf2, LCD_BUFFER_BYTES,
                            LV_DISPLAY_RENDER_MODE_PARTIAL);
 
     bsp_touch_init();
-    /* LVGL 官方 widget 示例（menuconfig 开启 LV_USE_DEMO_WIDGETS）
-     * 替换原 HSV 彩色刷屏，带可交互控件，配合触摸演示。 */
-    lv_demo_widgets();
+
+    /* 文件系统字体：注册 LVGL FS 驱动并从 /littlefs 加载 CJK 字体
+     * （驱动根目录就是 /littlefs，所以路径只写文件名） */
+    lv_fs_littlefs_register();
+    lv_font_t *cjk = lv_binfont_create("S:/lv_font_simhei_16_cjk.bin");
+    if (cjk != NULL) {
+        s_ui_asr_font = cjk;
+        ESP_LOGI(TAG, "CJK font loaded from littlefs");
+    } else {
+        s_ui_asr_font = (lv_font_t *)&lv_font_montserrat_14;
+        ESP_LOGW(TAG, "lv_font_simhei_16_cjk.bin not found on /littlefs, fallback to montserrat");
+    }
+
+    /* 演示屏(旋转按钮 + WiFi/IP, 替代官方 widget demo) */
+    demo_screen_create();
 
     ESP_LOGI(TAG, "display task started");
 #if CONFIG_LCD_LVGL_BENCHMARK
@@ -536,6 +812,11 @@ static void display_task(void *arg)
     run_fullscreen_benchmark();
 #endif
     while (1) {
+        touch_poll();   /* 触摸采样(200Hz) */
+        ui_apply();
+        if (s_shot_req != NULL) {
+            screenshot_execute();   /* 截图请求: 渲染当前屏(调试/文档) */
+        }
         uint32_t time_till_next = lv_timer_handler();
         /* Sleep until the next LVGL timer is due instead of polling every
          * DISPLAY_REFRESH_MS. lv_timer_handler() returns ms until the next
@@ -545,6 +826,76 @@ static void display_task(void *arg)
         }
         vTaskDelay(pdMS_TO_TICKS(time_till_next));
     }
+}
+
+/* ═══════════════ 截图(调试/文档): 请求显示任务渲染当前屏 ═══════════════
+ * HTTP 任务填充请求并阻塞等完成信号; 显示任务每帧轮询消费,
+ * 用 LVGL 快照把当前激活屏渲染成 RGB565 到调用方缓冲(PSRAM)。 */
+/* 显示任务上下文: 渲染当前激活屏到请求缓冲(RGB565) */
+static void screenshot_execute(void)
+{
+    screenshot_req_t *r = s_shot_req;
+    s_shot_req = NULL;
+    if (r == NULL || r->done == NULL || r->out == NULL) {
+        if (r != NULL && r->done != NULL) {
+            r->result = ESP_ERR_INVALID_ARG;
+            xSemaphoreGive(r->done);
+        }
+        return;
+    }
+    r->result = ESP_ERR_TIMEOUT;
+    lv_obj_t *scr = lv_screen_active();
+    if (scr != NULL) {
+        const int w = lv_display_get_horizontal_resolution(s_disp);
+        const int h = lv_display_get_vertical_resolution(s_disp);
+        if ((size_t)w * h * 3 <= r->out_cap) {
+            lv_draw_buf_t db;
+            /* RGB888(内存字节序 B,G,R) = 设计原色, 无 RGB565 量化误差 */
+            if (lv_draw_buf_init(&db, w, h, LV_COLOR_FORMAT_RGB888, w * 3, r->out,
+                                 (size_t)w * h * 3) == LV_RESULT_OK) {
+                if (lv_snapshot_take_to_draw_buf(scr, LV_COLOR_FORMAT_RGB888, &db) == LV_RESULT_OK) {
+                    r->w = w;
+                    r->h = h;
+                    r->result = ESP_OK;
+                } else {
+                    r->result = ESP_ERR_NOT_SUPPORTED;
+                }
+            } else {
+                r->result = ESP_ERR_NO_MEM;
+            }
+        } else {
+            r->result = ESP_ERR_INVALID_SIZE;
+        }
+    }
+    xSemaphoreGive(r->done);
+}
+
+esp_err_t lcd_lvgl_screenshot_rgb565(uint8_t *out, size_t out_cap,
+                                     int *out_w, int *out_h)
+{
+    if (out == NULL || out_w == NULL || out_h == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    screenshot_req_t req = {
+        .done = xSemaphoreCreateBinary(),
+        .out = out,
+        .out_cap = out_cap,
+        .w = 0,
+        .h = 0,
+        .result = ESP_ERR_TIMEOUT,
+    };
+    if (req.done == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    s_shot_req = &req;   /* 显示任务每帧轮询消费(≤5ms 一帧, 快照渲染后立即发信号) */
+    xSemaphoreTake(req.done, portMAX_DELAY);
+    const esp_err_t ret = req.result;
+    vSemaphoreDelete(req.done);
+    if (ret == ESP_OK) {
+        *out_w = req.w;
+        *out_h = req.h;
+    }
+    return ret;
 }
 
 /* ═══════════════ public API ═══════════════ */

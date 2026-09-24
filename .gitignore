@@ -75,3 +75,9 @@ Desktop.ini
 
 # WiFi credentials embedded in the LittleFS image
 data/wifi_config.json
+
+# fontwork 字库生成工具 - 构建垃圾
+tools/fontwork/node_modules/
+
+# 调试杂物
+*.upload.tmp

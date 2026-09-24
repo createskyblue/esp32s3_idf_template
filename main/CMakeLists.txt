@@ -1,5 +1,6 @@
 idf_component_register(SRCS "wifi_config_http.c" "main.c" "web_platform.c"
                          "app_storage.c" "wifi_config_store.c"
+                         "screenshot_web.c"
                     INCLUDE_DIRS "."
                     REQUIRES json wifi_manager ota_manager file_manager led_task cjson ble_host blufi_provisioning ble_echo ble_host_test lcd_lvgl sd_card
                     PRIV_REQUIRES esp_http_server esp_app_format littlefs log esp_system esp_timer heap freertos)

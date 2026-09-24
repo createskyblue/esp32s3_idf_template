@@ -1,3 +1,9 @@
+# 串口日志走 USB-Serial-JTAG（原生 USB 口, 与烧录同一虚拟串口）
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# 立创实战派 = ESP32-S3（不依赖 VSCode 扩展设置 IDF_TARGET, 固化到 defaults）
+CONFIG_IDF_TARGET="esp32s3"
+
 CONFIG_PARTITION_TABLE_SINGLE_APP=n
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
@@ -81,8 +87,11 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
 
 
-# LVGL 官方 widget 示例（替换 HSV 彩色刷屏，配合触摸演示）
-CONFIG_LV_USE_DEMO_WIDGETS=y
+# LVGL 官方 widget 示例关闭（替换为自带演示屏: 旋转按钮 + WiFi/IP, 见 lcd_lvgl.c）
+CONFIG_LV_USE_DEMO_WIDGETS=n
+
+# 网页截图调试功能(LVGL 快照渲染, /screenshot 端点)
+CONFIG_LV_USE_SNAPSHOT=y
 
 # 任务看门狗：widget demo 软件文字渲染较慢，留足余量
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
@@ -90,3 +99,19 @@ CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
 # LVGL 堆走 C malloc + PSRAM（demo 峰值内存需求大，48KB 静态池会 OOM 死循环）
 CONFIG_LV_USE_CLIB_MALLOC=y
 CONFIG_SPIRAM_USE_MALLOC=y
+
+# ---- DMA 稳定性(回流自 ESP32S3_VoiceInput, 参考 esp32s3-ai-circuit-toy):
+# GDMA 代码入 IRAM, 对象驻 DRAM。I2S 音频 DMA 与 AES 加密 DMA 等并发时,
+# 闪存缓存争用会拖死 DMA ISR 导致内存损坏 ----
+CONFIG_GDMA_CTRL_FUNC_IN_IRAM=y
+CONFIG_GDMA_ISR_HANDLER_IN_IRAM=y
+CONFIG_GDMA_OBJ_DRAM_SAFE=y
+
+# ---- TLS 内存优化: 握手后释放握手数据/证书, 记录缓冲按实际大小动态分配
+# (mbedTLS 占用 ~40KB 内部 RAM → 动态缓冲后大幅下降) ----
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT=y
+
+# main 任务栈 3584 太小(开机路径含 cJSON_Parse 等深调用), 加大到 8192
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
